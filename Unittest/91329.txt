@@ -1,0 +1,102 @@
+User Story ID: 91329
+Test Case Inventory:
+TC001
+  - Description: Generate plan with recognized operations (rename + set version + enable feature) produces deterministic JSON Patch array
+  - Scenario Type: Happy Path
+  - Expected Outcome: generatePlan returns patch as JSON array with ops in expected order (replace /name, replace /version, add /features/<key>) and non-empty summary
+TC002
+  - Description: Generate plan when app.json missing required fields normalizes app (adds default name/version/ui.fields/features) before interpreting requirements
+  - Scenario Type: Edge Case
+  - Expected Outcome: No exception; patch generation succeeds and uses normalized structure (e.g., ensureUiFieldsExist not failing)
+TC003
+  - Description: Generate plan with requirementText containing only whitespace
+  - Scenario Type: Edge Case
+  - Expected Outcome: IllegalArgumentException thrown with message "requirementText must not be empty"
+TC004
+  - Description: Generate plan with unrecognized requirementText (no matching regex patterns)
+  - Scenario Type: Edge Case
+  - Expected Outcome: Patch array is empty; summary indicates no recognized operations; service returns 200 with empty ops
+TC005
+  - Description: Generate plan for "add field <id>" when /ui is missing or not an object
+  - Scenario Type: Transformation-Level
+  - Expected Outcome: Patch includes add /ui {} then add /ui/fields [] then add /ui/fields/- {id,type,label}
+TC006
+  - Description: Generate plan for "add field <id>" when /ui/fields exists but is not an array
+  - Scenario Type: Edge Case
+  - Expected Outcome: Patch includes add /ui/fields [] (re-initialize) and then add /ui/fields/- field object
+TC007
+  - Description: Generate plan add field without label clause
+  - Scenario Type: Edge Case
+  - Expected Outcome: Generated field label defaults to fieldId; patch op value has label==id and type=="text"
+TC008
+  - Description: Generate plan enable feature with token containing "~" and "/" requires JSON Pointer escaping
+  - Scenario Type: Transformation-Level
+  - Expected Outcome: Patch path uses escaped token (~ -> ~0, / -> ~1) under /features; op value is boolean true
+TC009
+  - Description: Generate plan with both enable and disable feature instructions for different keys
+  - Scenario Type: Happy Path
+  - Expected Outcome: Patch contains add /features/key1 true and add /features/key2 false; summary includes both
+TC010
+  - Description: Apply changes with valid patch updates app, validates, writes atomically, and returns backupPath and updatedApp
+  - Scenario Type: Happy Path
+  - Expected Outcome: applyChanges returns validationStatus "OK"; backup file created; app.json content updated to patched JSON
+TC011
+  - Description: Apply changes where request.patch is not a JSON array (e.g., object node)
+  - Scenario Type: Negative Test
+  - Expected Outcome: IllegalArgumentException thrown "patch must be a JSON array of RFC6902 operations"
+TC012
+  - Description: Apply changes with syntactically invalid RFC6902 operations (JsonPatch.fromJson fails)
+  - Scenario Type: Negative Test
+  - Expected Outcome: IllegalArgumentException thrown starting with "Invalid patch:" and sanitized message (no CR/LF)
+TC013
+  - Description: Apply changes with patch operation that cannot be applied (e.g., replace non-existent deep path) causing JsonPatchException
+  - Scenario Type: Negative Test
+  - Expected Outcome: AppValidationException thrown "Patch could not be applied: ..." with sanitized message
+TC014
+  - Description: Apply changes with patch that sets invalid semantic version format
+  - Scenario Type: Negative Test
+  - Expected Outcome: AppValidationException thrown "App 'version' must be in semantic version format X.Y.Z"; no write performed
+TC015
+  - Description: Apply changes with patch that makes ui.fields non-array (e.g., replace /ui/fields with object)
+  - Scenario Type: Negative Test
+  - Expected Outcome: AppValidationException thrown "App 'ui.fields' must be an array"; no write performed
+TC016
+  - Description: Apply changes when appPath file does not exist
+  - Scenario Type: Edge Case
+  - Expected Outcome: NotFoundException thrown "App JSON not found at: ..." from readJson/backupAndAtomicWrite
+TC017
+  - Description: Apply changes with backupDir null/blank uses default "<parent>/.backup" and creates directory
+  - Scenario Type: Edge Case
+  - Expected Outcome: .backup directory created under app parent; backupPath returned points to created .bak file
+TC018
+  - Description: Apply changes when ATOMIC_MOVE is not supported triggers fallback move
+  - Scenario Type: Edge Case
+  - Expected Outcome: Operation completes successfully using non-atomic move; final app.json updated and temp file removed/moved
+TC019
+  - Description: validatedPath rejects null/blank appPath
+  - Scenario Type: Negative Test
+  - Expected Outcome: IllegalArgumentException thrown "appPath is required"
+TC020
+  - Description: validatedPath rejects suspicious path containing ".." segments
+  - Scenario Type: Edge Case
+  - Expected Outcome: IllegalArgumentException thrown "Invalid appPath"
+TC021
+  - Description: readJson with invalid JSON content in file
+  - Scenario Type: Negative Test
+  - Expected Outcome: AppValidationException thrown "Invalid JSON or unreadable file: ..." with sanitized message
+TC022
+  - Description: packageForDeployment with null/blank appPathStr uses default "app.json" and creates default bundle "datapowerai-bundle.zip"
+  - Scenario Type: Happy Path
+  - Expected Outcome: ZIP created at default name; PackageResult bytesWritten > 0; bundlePath is absolute path
+TC023
+  - Description: packageForDeployment with invalid app JSON (e.g., version not semver) fails validation before ZIP creation
+  - Scenario Type: Negative Test
+  - Expected Outcome: AppValidationException thrown; no output ZIP created/overwritten
+TC024
+  - Description: packageForDeployment with outputZipStr in nested directory creates missing parent directories
+  - Scenario Type: Edge Case
+  - Expected Outcome: Parent directories are created; ZIP file written successfully
+TC025
+  - Description: writeBundleZip produces ZIP with exactly app.json and manifest.json entries and consistent manifest fields
+  - Scenario Type: Transformation-Level
+  - Expected Outcome: ZIP contains two entries; manifest.json includes generatedAt, artifactType, appName, appVersion; bytesWritten equals sum of written JSON byte arrays
