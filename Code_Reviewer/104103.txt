@@ -1,0 +1,67 @@
+User Story ID: 104103
+Review Summary: Overall code quality is strong and largely aligned with enterprise standards. AAVA-style decoupling is implemented via a dedicated factory/adapter and secrets are sourced from environment variables. Main gaps are around audit logging, overly broad exception handling in the health endpoint, and a couple of maintainability improvements (constants, logging framework usage). No critical injection issues found.
+
+Findings:
+Issue: Broad exception handling in DbHealthController (catches generic Exception) which can mask root causes and hinder operational troubleshooting.
+Severity: Medium
+Recommendation: Catch more specific exceptions (e.g., SQLException) and log the exception with a correlation/request id using SLF4J at WARN/ERROR; keep the HTTP response generic to avoid information leakage.
+Compliance Impact: SOC2 (operational monitoring/auditability): reduced diagnosability without internal logs; Improper error handling can impact incident response.
+
+Issue: Missing audit/security logging for sensitive operations (DB connectivity/health checks) and lack of correlation id propagation.
+Severity: Medium
+Recommendation: Add structured logging (SLF4J + Logback/JSON encoder as per internal standard). Include request id/correlation id (from header or generated) and minimal metadata (endpoint, outcome, latency). Avoid logging secrets/connection strings. Consider adding Spring Actuator health indicator instead of custom controller for standardized health telemetry.
+Compliance Impact: SOC2: audit logging/traceability expectations for system access and critical operational checks may be unmet.
+
+Issue: Potential resource lifecycle concern: HikariDataSource is created directly; ensure it is closed on shutdown.
+Severity: Low
+Recommendation: In Spring, returning HikariDataSource as a DataSource bean is typically auto-closed. To be explicit, set destroyMethod = "close" on the @Bean or return HikariDataSource type. Example: @Bean(destroyMethod = "close") public DataSource dataSource(...).
+Compliance Impact: Availability/Resilience (SOC2): minor risk of resource leak on misconfiguration.
+
+Issue: Magic numbers in AavaDataSourceFactory (initializationFailTimeout 10_000) and pool name string literal.
+Severity: Low
+Recommendation: Replace with named constants (e.g., private static final long INIT_FAIL_TIMEOUT_MS = 10_000L; private static final String POOL_NAME = "dpai-aava-pool"), and consider making pool name configurable.
+Compliance Impact: None direct; improves maintainability.
+
+Issue: SecretProvider reads environment variables directly; no abstraction for enterprise secret managers and no rotation strategy shown.
+Severity: Medium
+Recommendation: Keep current env-based provider as default, but add an interface implementation for approved secret management (Vault/KMS/Secrets Manager) and document rotation expectations. Ensure secrets are not cached longer than necessary (token TTL) if IAM tokens rotate.
+Compliance Impact: PCI-DSS/SOC2 (secrets management controls): environment variables may be acceptable internally but often require documented controls/rotation and restricted access.
+
+Issue: Test reliability/portability: DbHealthControllerTest depends on external env var presence to start; may fail in CI without explicit configuration.
+Severity: Low
+Recommendation: Use @DynamicPropertySource or Testcontainers, or set a test profile that uses an embedded DB and injects secrets via test configuration. Alternatively, mock SecretProvider/DataSource for controller tests.
+Compliance Impact: None direct; impacts CI reliability.
+
+Issue: Configuration files: duplicate 'spring:' key in application.yml (two top-level spring blocks). YAML allows it but later key overwrites earlier in some parsers; can cause misconfiguration.
+Severity: Medium
+Recommendation: Merge into a single 'spring:' block to avoid override ambiguity.
+Compliance Impact: Availability/Change management (SOC2): misconfiguration risk.
+
+Code Quality Score: 9.0/10
+
+Security Assessment: 
+- Input validation: No user input used in SQL or command execution paths; health endpoint uses constant query.
+- SQL Injection: Not detected (PreparedStatement with constant "SELECT 1").
+- Command Injection: Not present (no Runtime.exec/ProcessBuilder usage).
+- Hardcoded secrets: Not detected in code/config; secrets sourced from env vars only. (Note: sample command shows setting a password env var for dev; ensure dev secrets are non-production.)
+- Sensitive data logging: Not detected; controller avoids detailed errors. However, absence of internal logs reduces diagnostics.
+- Insecure deserialization/XXE/Path traversal/Weak crypto/Insecure randomness: Not present in provided code.
+- Broken access control: Health endpoint is unauthenticated; acceptable only if intended. If deployed beyond internal network, add authentication/authorization or restrict via network policy.
+
+Compliance Checklist:
+- PCI-DSS:
+  - PAN/CVV storage/logging: Not applicable in provided code (no payment data handling).
+  - Secrets management: Partially met (no hardcoded secrets; env vars used). Consider enterprise secret manager for stronger controls.
+  - Encryption in transit/at rest: Not shown (depends on DB/JDBC/infra). Ensure TLS to DB in QA/Prod.
+- SOC2:
+  - Audit logging/monitoring: Partially met (Actuator included; app-level audit logs missing for operational events).
+  - Access control: Not met/Unknown for /api/db/health (no auth shown). Ensure environment-appropriate protection.
+  - Change/config management: Medium risk due to duplicate YAML keys.
+- Internal coding standards:
+  - Naming conventions: Met.
+  - Layered package structure: Mostly met (api/config/integration/security). No repository/service layers present (OK for minimal scope).
+  - Javadoc on public classes/methods: Mostly met.
+  - Logging framework: Not met/Partial (no explicit SLF4J usage in controller; also no System.out.println present).
+  - Immutability/final usage: Acceptable (controller field final; factory class final).
+
+Audit Log Reference: 2026-09-18-104103-CR01
