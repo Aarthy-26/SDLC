@@ -1,377 +1,361 @@
-/*
- * Story ID: 104470
- * Title   : App Version Management / Version History – Backend
- * Type    : (Azure DevOps work item; type not returned by tool)
- * State   : Ready for QA
- * Area    : AAVA\\AAVA - Data Studio\\DPAI
- * Iteration: AAVA\\PI4\\Sprint 3
- * Assigned: Neha Ghatge
- *
- * What this code does
- * -------------------
- * Implements backend APIs for application version management:
- *  1) GET  /api/apps/{appId}/versions
- *  2) POST /api/apps/{appId}/versions/{versionNumber}/restore
- *
- * It follows the repository conventions (Spring Boot + Security + JdbcTemplate + ApiResponse).
- *
- * Build/Run (standalone Java file requirements from the agent prompt)
- * ------------------------------------------------------------------
- * NOTE: The repository referenced by the user story is a Spring Boot project (Java 21).
- * This single file is generated per instructions, but it contains Spring components and
- * is not intended to be compiled with plain `javac` alone.
- *
- *   javac 104470.java
- *   java AppVersionManagementApi104470
- *
- * Assumptions (because repo lacks App/Version tables/models)
- * ---------------------------------------------------------
- * 1) Database schema uses following tables:
- *      dpai.apps(app_id UUID PK, name TEXT, current_version INT, updated_at timestamptz)
- *      dpai.app_versions(app_id UUID FK, version_number INT, created_at timestamptz, created_by TEXT,
- *                        is_active BOOLEAN, is_deleted BOOLEAN, config_json TEXT)
- *    If schema differs, adjust SQL in AppVersionRepositoryJdbc accordingly.
- * 2) Authorization model: reuse Spring Security roles; viewing versions requires authentication,
- *    restoring requires ROLE_TOOL_ADMIN or ROLE_PROJECT_ADMIN (matches existing patterns).
- * 3) Audit logging: reuse existing AuditService.logAction(actionType, targetName). The story
- *    asks for more detailed audit fields; since AuditService currently stores actionType/targetName,
- *    we encode details into targetName as a JSON-like string.
- * 4) Concurrency: restore uses a DB transaction + SELECT ... FOR UPDATE on dpai.apps row
- *    to prevent concurrent restores.
- *
- * Compliance / Audit Log (generation-time)
- * --------------------------------------
- * - Parsed requirement from Azure DevOps work item 104470.
- * - Repo conventions detected: Spring Boot controllers/services/repositories, ApiResponse wrapper,
- *   JWT security, AuditService.
- * - No secrets/PII added. (Note: repo reference contains credentials in application.yml; not used here.)
- */
+package com.aava.datapowerai.controller;
 
 import com.aava.datapowerai.dto.common.ApiResponse;
 import com.aava.datapowerai.model.UserModel;
 import com.aava.datapowerai.service.AuditService;
 import com.aava.datapowerai.service.UserService;
-import jakarta.validation.constraints.NotNull;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.support.GeneratedKeyHolder;
+import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Repository;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.sql.PreparedStatement;
+import java.sql.Statement;
 import java.time.OffsetDateTime;
 import java.util.*;
 
-// Non-public class name per instructions.
-class AppVersionManagementApi104470 {
+/**
+ * Story ID: 104470
+ * Title: App Version Management / Version History – Backend
+ *
+ * Implements backend APIs for application version history:
+ *  - GET /api/apps/{appId}/versions
+ *  - POST /api/apps/{appId}/versions/{versionNumber}/restore
+ *
+ * Assumptions (not found in repo content):
+ *  - "Application" is represented by a DB table dpai.apps with at least (id UUID, active_version INT).
+ *  - Versions are represented by dpai.app_versions with at least (app_id UUID, version_number INT,
+ *    created_at timestamptz, created_by UUID nullable, is_deleted boolean, is_accessible boolean,
+ *    snapshot_json text).
+ *  - Restoring a version updates dpai.apps.active_version and (optionally) dpai.apps.config_json from snapshot_json.
+ *  - Concurrency is controlled via SELECT ... FOR UPDATE on dpai.apps row.
+ *
+ * SQL (DDL sketch) used by repositories (informational only):
+ *  - dpai.apps(id uuid primary key, active_version int, config_json text, updated_at timestamptz)
+ *  - dpai.app_versions(app_id uuid, version_number int, created_at timestamptz, created_by uuid,
+ *      is_deleted boolean default false, is_accessible boolean default true, snapshot_json text,
+ *      primary key(app_id, version_number))
+ */
+class AppVersionManagementBackend {
 
-    /*
-     * Minimal runnable entrypoint per prompt.
-     * In the real repo, Spring Boot app is started via com.aava.datapowerai.DataPowerAIApplication.
-     */
-    public static void main(String[] args) {
-        System.out.println("This file defines Spring components for Story 104470.");
-        System.out.println("Run the Spring Boot application (DataPowerAIApplication) to use the APIs.");
-        System.out.println();
-        System.out.println("Endpoints:");
-        System.out.println("  GET  /api/apps/{appId}/versions");
-        System.out.println("  POST /api/apps/{appId}/versions/{versionNumber}/restore");
-    }
-
-    // ==========================
-    // Controller
-    // ==========================
+    // --- Controller ---
 
     @RestController
     @RequestMapping("/api/apps")
+    @Tag(name = "App Versions", description = "Application version history and restore")
     static class AppVersionController {
+        private static final Logger log = LoggerFactory.getLogger(AppVersionController.class);
 
-        private final AppVersionService appVersionService;
+        private final AppVersionService service;
+        private final UserService userService;
 
-        AppVersionController(AppVersionService appVersionService) {
-            this.appVersionService = appVersionService;
+        AppVersionController(AppVersionService service, UserService userService) {
+            this.service = service;
+            this.userService = userService;
         }
 
         @GetMapping("/{appId}/versions")
         @PreAuthorize("isAuthenticated()")
-        public ResponseEntity<ApiResponse<List<AppVersionDto>>> getVersions(@PathVariable("appId") UUID appId) {
+        @Operation(summary = "Get all versions for an application")
+        public ResponseEntity<ApiResponse<List<AppVersionDto>>> getVersions(
+                @PathVariable("appId") UUID appId,
+                Authentication authentication) {
+
+            // ASSUMPTION: repo does not have app-level authorization; we enforce minimal role-based guard.
+            if (!hasAnyAdminOrEditorRole(authentication)) {
+                return ResponseEntity.status(403).body(ApiResponse.failure("Forbidden — insufficient permissions"));
+            }
+
             try {
-                List<AppVersionDto> versions = appVersionService.getVersions(appId);
+                List<AppVersionDto> versions = service.getVersions(appId);
                 if (versions.isEmpty()) {
-                    // Requirement: "appropriate response when no versions are available".
-                    return ResponseEntity.ok(ApiResponse.success("No versions available for this application", versions));
+                    return ResponseEntity.ok(ApiResponse.success("No versions available", versions));
                 }
                 return ResponseEntity.ok(ApiResponse.success("Versions retrieved successfully", versions));
-            } catch (NotFoundException nf) {
-                return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                        .body(ApiResponse.failure(nf.getMessage()));
-            } catch (ForbiddenException fe) {
-                return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                        .body(ApiResponse.failure(fe.getMessage()));
-            } catch (UnauthorizedException ue) {
-                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                        .body(ApiResponse.failure(ue.getMessage()));
-            } catch (DataAccessException dae) {
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body(ApiResponse.failure("Database error while retrieving versions"));
-            } catch (Exception ex) {
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body(ApiResponse.failure("Unexpected error while retrieving versions: " + ex.getMessage()));
+            } catch (NotFoundException e) {
+                return ResponseEntity.status(404).body(ApiResponse.failure(e.getMessage()));
+            } catch (Exception e) {
+                log.error("Failed to get versions for appId={}: {}", appId, e.getMessage(), e);
+                return ResponseEntity.status(500).body(ApiResponse.failure("Failed to retrieve versions"));
             }
         }
 
         @PostMapping("/{appId}/versions/{versionNumber}/restore")
-        @PreAuthorize("hasAnyRole('TOOL_ADMIN','PROJECT_ADMIN')")
+        @PreAuthorize("isAuthenticated()")
+        @Operation(summary = "Restore an application to a selected version")
         public ResponseEntity<ApiResponse<RestoreResultDto>> restore(
                 @PathVariable("appId") UUID appId,
-                @PathVariable("versionNumber") int versionNumber) {
+                @PathVariable("versionNumber") int versionNumber,
+                Authentication authentication) {
+
+            // ASSUMPTION: restore requires elevated rights.
+            if (!hasAnyAdminRole(authentication)) {
+                return ResponseEntity.status(403).body(ApiResponse.failure("Forbidden — requires admin role"));
+            }
+
+            String actorUsername = userService.getCurrentUser().map(UserModel::getUsername).orElse("UNKNOWN");
 
             try {
-                RestoreResultDto result = appVersionService.restoreVersion(appId, versionNumber);
-                return ResponseEntity.ok(ApiResponse.success("Version restored successfully", result));
-            } catch (NotFoundException nf) {
-                return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                        .body(ApiResponse.failure(nf.getMessage()));
-            } catch (ConflictException ce) {
-                return ResponseEntity.status(HttpStatus.CONFLICT)
-                        .body(ApiResponse.failure(ce.getMessage()));
-            } catch (ForbiddenException fe) {
-                return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                        .body(ApiResponse.failure(fe.getMessage()));
-            } catch (UnauthorizedException ue) {
-                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                        .body(ApiResponse.failure(ue.getMessage()));
-            } catch (DataAccessException dae) {
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body(ApiResponse.failure("Database error during restore"));
-            } catch (Exception ex) {
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body(ApiResponse.failure("Unexpected restoration failure: " + ex.getMessage()));
+                RestoreResultDto result = service.restore(appId, versionNumber, actorUsername);
+                return ResponseEntity.ok(ApiResponse.success("Restore completed successfully", result));
+            } catch (NotFoundException e) {
+                return ResponseEntity.status(404).body(ApiResponse.failure(e.getMessage()));
+            } catch (ConflictException e) {
+                return ResponseEntity.status(409).body(ApiResponse.failure(e.getMessage()));
+            } catch (IllegalArgumentException e) {
+                return ResponseEntity.status(400).body(ApiResponse.failure(e.getMessage()));
+            } catch (Exception e) {
+                log.error("Restore failed for appId={} version={}: {}", appId, versionNumber, e.getMessage(), e);
+                return ResponseEntity.status(500).body(ApiResponse.failure("Restore failed"));
             }
+        }
+
+        private boolean hasAnyAdminRole(Authentication auth) {
+            if (auth == null) return false;
+            return auth.getAuthorities().stream().anyMatch(a -> {
+                String r = a.getAuthority();
+                return "ROLE_TOOL_ADMIN".equals(r) || "ROLE_PROJECT_ADMIN".equals(r) || "ROLE_ADMIN".equals(r);
+            });
+        }
+
+        private boolean hasAnyAdminOrEditorRole(Authentication auth) {
+            if (auth == null) return false;
+            return auth.getAuthorities().stream().anyMatch(a -> {
+                String r = a.getAuthority();
+                return "ROLE_TOOL_ADMIN".equals(r) || "ROLE_PROJECT_ADMIN".equals(r) || "ROLE_ADMIN".equals(r)
+                        || "ROLE_EDITOR".equals(r) || "ROLE_USER".equals(r) || "ROLE_READ_ONLY".equals(r);
+            });
         }
     }
 
-    // ==========================
-    // Service
-    // ==========================
+    // --- Service ---
 
     @Service
     static class AppVersionService {
-
-        private final AppVersionRepositoryJdbc repo;
-        private final UserService userService;
+        private final AppRepository appRepository;
+        private final AppVersionRepository versionRepository;
         private final AuditService auditService;
 
-        AppVersionService(AppVersionRepositoryJdbc repo, UserService userService, AuditService auditService) {
-            this.repo = repo;
-            this.userService = userService;
+        AppVersionService(AppRepository appRepository, AppVersionRepository versionRepository, AuditService auditService) {
+            this.appRepository = appRepository;
+            this.versionRepository = versionRepository;
             this.auditService = auditService;
         }
 
-        public List<AppVersionDto> getVersions(@NotNull UUID appId) {
-            // Validate application exists
-            if (!repo.appExists(appId)) {
+        public List<AppVersionDto> getVersions(UUID appId) {
+            if (!appRepository.existsById(appId)) {
                 throw new NotFoundException("Application not found");
             }
 
-            // Authorization: story says "Users should only retrieve versions for apps they are authorized to access".
-            // Repo has project membership authorization only for projects, and no app/project mapping exists.
-            // Assumption: authenticated users can view versions; restore has stricter role-based guard.
-            // (If app-level ACL exists, implement it in repo.hasAccess(appId, userId).)
+            Integer active = appRepository.findActiveVersion(appId).orElse(null);
+            List<AppVersionModel> models = versionRepository.findValidAccessibleByAppId(appId);
 
-            return repo.findVersionsByAppId(appId);
+            List<AppVersionDto> out = new ArrayList<>(models.size());
+            for (AppVersionModel m : models) {
+                out.add(new AppVersionDto(
+                        m.versionNumber(),
+                        m.createdAt(),
+                        m.createdBy(),
+                        Objects.equals(active, m.versionNumber())
+                ));
+            }
+            return out;
         }
 
-        @Transactional(isolation = Isolation.READ_COMMITTED)
-        public RestoreResultDto restoreVersion(@NotNull UUID appId, int versionNumber) {
-            // Validate app
-            if (!repo.appExists(appId)) {
-                throw new NotFoundException("Application not found");
+        @Transactional
+        public RestoreResultDto restore(UUID appId, int versionNumber, String actorUsername) {
+            if (versionNumber <= 0) {
+                throw new IllegalArgumentException("versionNumber must be positive");
             }
 
-            // Validate requested version exists and belongs to app
-            Optional<AppVersionRecord> verOpt = repo.findVersionRecord(appId, versionNumber);
-            if (verOpt.isEmpty()) {
-                throw new NotFoundException("Version not found");
-            }
-            AppVersionRecord ver = verOpt.get();
-            if (ver.isDeleted() || !ver.isAccessible()) {
-                throw new ConflictException("Requested version is invalid or inaccessible");
-            }
+            // lock app row to prevent concurrent restores leaving partial state
+            AppModel app = appRepository.lockById(appId).orElseThrow(() -> new NotFoundException("Application not found"));
 
-            // Lock app row to prevent concurrent restore operations
-            repo.lockAppRow(appId);
+            AppVersionModel version = versionRepository.findValidAccessible(appId, versionNumber)
+                    .orElseThrow(() -> new NotFoundException("Version not found"));
 
-            // If already active, treat as no-op success (not specified; simplest is to succeed)
-            Optional<Integer> current = repo.getCurrentVersionNumber(appId);
-            if (current.isPresent() && current.get() == versionNumber) {
-                return new RestoreResultDto(appId, versionNumber, true, "Version already active", OffsetDateTime.now());
+            // validate relationship
+            if (!Objects.equals(version.appId(), app.id())) {
+                throw new IllegalArgumentException("Invalid version/application relationship");
             }
 
-            // Restore application "configuration/data". Assumption: apps table has config_json.
-            // If you store config in other tables, replicate here transactionally.
-            boolean restored = repo.restoreAppConfigFromVersion(appId, versionNumber);
-            if (!restored) {
-                throw new ConflictException("Restore operation conflict or failed to update app state");
+            // conflict: restoring to already active version
+            Integer current = app.activeVersion();
+            if (current != null && current == versionNumber) {
+                throw new ConflictException("Requested version is already the active version");
             }
 
-            // Update active flags in versions table
-            repo.markActiveVersion(appId, versionNumber);
+            // restore config/data from snapshot
+            appRepository.restoreFromSnapshot(appId, version.snapshotJson(), versionNumber);
 
-            // Audit & logging
-            String actor = userService.getCurrentUser().map(UserModel::getUsername).orElse("UNKNOWN");
-            String details = "{\"appId\":\"" + appId + "\",\"restoredVersion\":" + versionNumber + ",\"status\":\"SUCCESS\"}";
-            auditService.logAction("APP_VERSION_RESTORE", details + ";actor=" + actor);
+            // audit per existing pattern
+            auditService.logAction("APP_VERSION_RESTORE", "appId=" + appId + ", version=" + versionNumber + ", status=SUCCESS");
 
-            return new RestoreResultDto(appId, versionNumber, true, "Restored", OffsetDateTime.now());
+            return new RestoreResultDto(appId, versionNumber, current, OffsetDateTime.now(), actorUsername);
         }
     }
 
-    // ==========================
-    // Repository (JdbcTemplate)
-    // ==========================
+    // --- Repositories (JdbcTemplate style, matching repo conventions) ---
 
     @Repository
-    static class AppVersionRepositoryJdbc {
-        private final JdbcTemplate jdbc;
+    static class AppRepository {
+        private final JdbcTemplate jdbcTemplate;
 
-        AppVersionRepositoryJdbc(JdbcTemplate jdbc) {
-            this.jdbc = jdbc;
+        AppRepository(JdbcTemplate jdbcTemplate) {
+            this.jdbcTemplate = jdbcTemplate;
         }
 
-        boolean appExists(UUID appId) {
-            String sql = "SELECT 1 FROM dpai.apps WHERE app_id = ? LIMIT 1";
-            List<Integer> rows = jdbc.queryForList(sql, Integer.class, appId);
-            return !rows.isEmpty();
+        boolean existsById(UUID appId) {
+            String sql = "SELECT 1 FROM dpai.apps WHERE id = ? LIMIT 1";
+            List<Integer> r = jdbcTemplate.queryForList(sql, Integer.class, appId);
+            return !r.isEmpty();
         }
 
-        void lockAppRow(UUID appId) {
-            // Prevent concurrent restore operations safely.
-            String sql = "SELECT app_id FROM dpai.apps WHERE app_id = ? FOR UPDATE";
-            jdbc.queryForList(sql, UUID.class, appId);
-        }
-
-        Optional<Integer> getCurrentVersionNumber(UUID appId) {
-            String sql = "SELECT current_version FROM dpai.apps WHERE app_id = ?";
-            List<Integer> rows = jdbc.queryForList(sql, Integer.class, appId);
-            return rows.isEmpty() ? Optional.empty() : Optional.ofNullable(rows.get(0));
-        }
-
-        List<AppVersionDto> findVersionsByAppId(UUID appId) {
-            // Exclude deleted/inaccessible versions.
-            String sql = """
-                    SELECT app_id, version_number, created_at, created_by, is_active
-                      FROM dpai.app_versions
-                     WHERE app_id = ?
-                       AND COALESCE(is_deleted, false) = false
-                     ORDER BY version_number DESC
-                    """;
-
-            RowMapper<AppVersionDto> rm = (rs, rn) -> new AppVersionDto(
-                    rs.getObject("app_id", UUID.class),
-                    rs.getInt("version_number"),
-                    rs.getObject("created_at", OffsetDateTime.class),
-                    rs.getString("created_by"),
-                    rs.getBoolean("is_active")
-            );
-
-            return jdbc.query(sql, rm, appId);
-        }
-
-        Optional<AppVersionRecord> findVersionRecord(UUID appId, int versionNumber) {
-            String sql = """
-                    SELECT app_id, version_number, created_at, created_by,
-                           COALESCE(is_active,false) AS is_active,
-                           COALESCE(is_deleted,false) AS is_deleted,
-                           COALESCE(config_json,'')  AS config_json
-                      FROM dpai.app_versions
-                     WHERE app_id = ? AND version_number = ?
-                     LIMIT 1
-                    """;
-            List<AppVersionRecord> list = jdbc.query(sql, (rs, rn) -> new AppVersionRecord(
-                    rs.getObject("app_id", UUID.class),
-                    rs.getInt("version_number"),
-                    rs.getObject("created_at", OffsetDateTime.class),
-                    rs.getString("created_by"),
-                    rs.getBoolean("is_active"),
-                    rs.getBoolean("is_deleted"),
-                    rs.getString("config_json"),
-                    true
-            ), appId, versionNumber);
-
+        Optional<Integer> findActiveVersion(UUID appId) {
+            String sql = "SELECT active_version FROM dpai.apps WHERE id = ?";
+            List<Integer> list = jdbcTemplate.query(sql, (rs, rn) -> {
+                int v = rs.getInt("active_version");
+                return rs.wasNull() ? null : v;
+            }, appId);
             return list.stream().findFirst();
         }
 
-        boolean restoreAppConfigFromVersion(UUID appId, int versionNumber) {
-            // Transactional operation (service method annotated @Transactional).
-            // Assumption: dpai.apps has config_json column.
-            String sql = """
-                    UPDATE dpai.apps a
-                       SET config_json = v.config_json,
-                           current_version = v.version_number,
-                           updated_at = now()
-                      FROM dpai.app_versions v
-                     WHERE a.app_id = v.app_id
-                       AND a.app_id = ?
-                       AND v.version_number = ?
-                       AND COALESCE(v.is_deleted,false) = false
-                    """;
-            int updated = jdbc.update(sql, appId, versionNumber);
-            return updated == 1;
+        Optional<AppModel> lockById(UUID appId) {
+            // SELECT ... FOR UPDATE to serialize restore operations per app
+            String sql = "SELECT id, active_version FROM dpai.apps WHERE id = ? FOR UPDATE";
+            List<AppModel> list = jdbcTemplate.query(sql, (rs, rn) -> new AppModel(
+                    rs.getObject("id", UUID.class),
+                    (Integer) rs.getObject("active_version")
+            ), appId);
+            return list.stream().findFirst();
         }
 
-        void markActiveVersion(UUID appId, int versionNumber) {
-            // Make selected version active/current.
-            String clearSql = "UPDATE dpai.app_versions SET is_active = false WHERE app_id = ?";
-            jdbc.update(clearSql, appId);
-
-            String setSql = "UPDATE dpai.app_versions SET is_active = true WHERE app_id = ? AND version_number = ?";
-            int updated = jdbc.update(setSql, appId, versionNumber);
+        void restoreFromSnapshot(UUID appId, String snapshotJson, int versionNumber) {
+            // ASSUMPTION: config_json exists and should be replaced by snapshot_json
+            String sql = """
+                    UPDATE dpai.apps
+                       SET config_json = ?,
+                           active_version = ?,
+                           updated_at = now()
+                     WHERE id = ?
+                    """;
+            int updated = jdbcTemplate.update(sql, snapshotJson, versionNumber, appId);
             if (updated != 1) {
-                throw new ConflictException("Failed to mark restored version as active");
+                throw new DataAccessException("Failed to update app active version") {};
             }
         }
     }
 
-    // ==========================
-    // DTOs / Records
-    // ==========================
+    @Repository
+    static class AppVersionRepository {
+        private final JdbcTemplate jdbcTemplate;
 
-    static record AppVersionDto(
+        AppVersionRepository(JdbcTemplate jdbcTemplate) {
+            this.jdbcTemplate = jdbcTemplate;
+        }
+
+        private final RowMapper<AppVersionModel> rowMapper = (rs, rn) -> new AppVersionModel(
+                rs.getObject("app_id", UUID.class),
+                rs.getInt("version_number"),
+                rs.getObject("created_at", OffsetDateTime.class),
+                rs.getObject("created_by", UUID.class),
+                rs.getBoolean("is_deleted"),
+                rs.getBoolean("is_accessible"),
+                rs.getString("snapshot_json")
+        );
+
+        List<AppVersionModel> findValidAccessibleByAppId(UUID appId) {
+            String sql = """
+                    SELECT app_id, version_number, created_at, created_by, is_deleted, is_accessible, snapshot_json
+                      FROM dpai.app_versions
+                     WHERE app_id = ?
+                       AND COALESCE(is_deleted, false) = false
+                       AND COALESCE(is_accessible, true) = true
+                     ORDER BY version_number DESC
+                    """;
+            return jdbcTemplate.query(sql, rowMapper, appId);
+        }
+
+        Optional<AppVersionModel> findValidAccessible(UUID appId, int versionNumber) {
+            String sql = """
+                    SELECT app_id, version_number, created_at, created_by, is_deleted, is_accessible, snapshot_json
+                      FROM dpai.app_versions
+                     WHERE app_id = ? AND version_number = ?
+                       AND COALESCE(is_deleted, false) = false
+                       AND COALESCE(is_accessible, true) = true
+                     LIMIT 1
+                    """;
+            List<AppVersionModel> list = jdbcTemplate.query(sql, rowMapper, appId, versionNumber);
+            return list.stream().findFirst();
+        }
+
+        // Optional helper if future requirements need recording new audit/version data.
+        UUID insertRestoreAudit(UUID appId, int versionNumber, String actorUsername, String status, String failureReason) {
+            // ASSUMPTION: not found in repo content. If an audit table exists already, prefer AuditService.
+            String sql = """
+                    INSERT INTO dpai.app_version_restore_audit
+                      (app_id, version_number, actor_username, status, failure_reason)
+                    VALUES (?, ?, ?, ?, ?)
+                    """;
+            KeyHolder kh = new GeneratedKeyHolder();
+            jdbcTemplate.update(con -> {
+                PreparedStatement ps = con.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
+                ps.setObject(1, appId);
+                ps.setInt(2, versionNumber);
+                ps.setString(3, actorUsername);
+                ps.setString(4, status);
+                ps.setString(5, failureReason);
+                return ps;
+            }, kh);
+            var key = kh.getKey();
+            return key == null ? UUID.randomUUID() : UUID.fromString(key.toString());
+        }
+    }
+
+    // --- Models/DTOs ---
+
+    // ASSUMPTION: not found in repo content
+    static record AppModel(UUID id, Integer activeVersion) {}
+
+    // ASSUMPTION: not found in repo content
+    static record AppVersionModel(
             UUID appId,
             int versionNumber,
             OffsetDateTime createdAt,
-            String createdBy,
+            UUID createdBy,
+            boolean deleted,
+            boolean accessible,
+            String snapshotJson
+    ) {}
+
+    static record AppVersionDto(
+            int versionNumber,
+            OffsetDateTime createdAt,
+            UUID createdBy,
             boolean active
     ) {}
 
     static record RestoreResultDto(
             UUID appId,
             int restoredVersion,
-            boolean success,
-            String message,
-            OffsetDateTime restoredAt
+            Integer previousActiveVersion,
+            OffsetDateTime restoredAt,
+            String restoredBy
     ) {}
 
-    static record AppVersionRecord(
-            UUID appId,
-            int versionNumber,
-            OffsetDateTime createdAt,
-            String createdBy,
-            boolean active,
-            boolean isDeleted,
-            String configJson,
-            boolean isAccessible
-    ) {}
-
-    // ==========================
-    // Exceptions (simple)
-    // ==========================
+    // --- Exceptions (kept minimal; repo uses GlobalExceptionHandler but controllers also map some statuses) ---
 
     static class NotFoundException extends RuntimeException {
         NotFoundException(String message) { super(message); }
@@ -379,13 +363,5 @@ class AppVersionManagementApi104470 {
 
     static class ConflictException extends RuntimeException {
         ConflictException(String message) { super(message); }
-    }
-
-    static class ForbiddenException extends RuntimeException {
-        ForbiddenException(String message) { super(message); }
-    }
-
-    static class UnauthorizedException extends RuntimeException {
-        UnauthorizedException(String message) { super(message); }
     }
 }
