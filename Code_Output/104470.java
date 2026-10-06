@@ -1,35 +1,32 @@
 /*
- * Story ID: 104470
+ * Work Item: 104470
  * Title: App Version Management / Version History – Backend
  *
  * What this program does:
- * This is a single-file, runnable Java 17+ program that simulates the backend behavior
- * described in the work item for application version management:
- *   - GET /api/apps/{appId}/versions
- *   - POST /api/apps/{appId}/versions/{versionNumber}/restore
- *
- * It exposes a tiny HTTP server (built-in JDK HttpServer) with in-memory storage,
- * validates inputs, enforces a simple authorization model, performs transactional restore
- * with a lock per app to avoid concurrent restore conflicts, and returns consistent JSON
- * success/error responses.
+ * - Implements a minimal, runnable HTTP backend (no external dependencies) that exposes:
+ *     GET  /api/apps/{appId}/versions
+ *     POST /api/apps/{appId}/versions/{versionNumber}/restore
+ * - Uses an in-memory store to model applications, versions, authorization, transactional restore,
+ *   concurrency control, and audit logging as required by the work item.
  *
  * Compile:
  *   javac 104470.java
+ *
  * Run:
- *   java AppVersionManagementBackend --port 8080
+ *   java AppVersionManagementServer --port=8080
  *
- * Assumptions (due to missing specifics in the work item):
- *   - Authorization is simulated via HTTP header "Authorization: Bearer <token>".
- *     Tokens are hardcoded as:
- *       * builder-token  => can read versions
- *       * restorer-token => can read + restore
- *       * admin-token    => can read + restore
- *   - "Application configuration/data" is represented as a JSON string blob stored per version.
- *   - Version metadata "createdBy" is a username in the token map.
- *   - Response formats are defined here because the work item does not specify exact schemas.
- *   - "Invalid/deleted/inaccessible versions" are represented by flags (deleted=false, accessible=true).
+ * Assumptions (due to missing DB / existing app model in provided repo snapshot):
+ * - "Application" and "Version" persistence is simulated in-memory.
+ * - Authorization is simulated via HTTP headers:
+ *     X-User: <username>
+ *     X-Roles: comma-separated roles (e.g. APP_VIEWER,APP_RESTORER,ADMIN)
+ *   Required permission:
+ *     - GET versions: authenticated user with APP_VIEWER or ADMIN
+ *     - RESTORE: authenticated user with APP_RESTORER or ADMIN
+ * - Version numbers are positive integers.
+ * - Invalid/deleted/inaccessible versions are modeled by a boolean flag and are excluded.
  *
- * Requires: Java 17+
+ * Requires Java 17+.
  */
 
 import com.sun.net.httpserver.Headers;
@@ -37,484 +34,570 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.ReentrantReadWriteLock;
 
-class AppVersionManagementBackend {
+class AppVersionManagementServer {
 
-    // ----------------------------
-    // Data model (in-memory)
-    // ----------------------------
+    // --------------------------- API Response Model ---------------------------
 
-    static final class App {
-        final String appId;
-        final Map<Integer, Version> versionsByNumber = new HashMap<>();
-        int activeVersion;
-        String activeConfig;
+    static final class ApiResponse {
+        final boolean success;
+        final String message;
+        final Object data;
+        final Instant timestamp;
+        final ErrorDetails error;
 
-        App(String appId) {
-            this.appId = appId;
+        ApiResponse(boolean success, String message, Object data, ErrorDetails error) {
+            this.success = success;
+            this.message = message;
+            this.data = data;
+            this.error = error;
+            this.timestamp = Instant.now();
+        }
+
+        static ApiResponse ok(String message, Object data) {
+            return new ApiResponse(true, message, data, null);
+        }
+
+        static ApiResponse ok(String message) {
+            return new ApiResponse(true, message, null, null);
+        }
+
+        static ApiResponse fail(String message, ErrorDetails error) {
+            return new ApiResponse(false, message, null, error);
         }
     }
 
-    static final class Version {
+    static final class ErrorDetails {
+        final int status;
+        final String code;
+        final String details;
+
+        ErrorDetails(int status, String code, String details) {
+            this.status = status;
+            this.code = code;
+            this.details = details;
+        }
+    }
+
+    // --------------------------- Domain Model ---------------------------
+
+    static final class App {
+        final String appId;
+        String activeConfigJson;
+        int activeVersion;
+
+        // Concurrency control: ensure restore is transactional and safe.
+        final ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
+
+        App(String appId, String activeConfigJson, int activeVersion) {
+            this.appId = appId;
+            this.activeConfigJson = activeConfigJson;
+            this.activeVersion = activeVersion;
+        }
+    }
+
+    static final class AppVersion {
+        final String appId;
         final int versionNumber;
-        final Instant createdAt;
+        final OffsetDateTime createdAt;
         final String createdBy;
-        final String configSnapshot;
+        final String configJson;
+
+        // Business rules flags
         boolean deleted;
         boolean accessible;
 
-        Version(int versionNumber, Instant createdAt, String createdBy, String configSnapshot,
-                boolean deleted, boolean accessible) {
+        AppVersion(String appId, int versionNumber, OffsetDateTime createdAt, String createdBy, String configJson,
+                   boolean deleted, boolean accessible) {
+            this.appId = appId;
             this.versionNumber = versionNumber;
             this.createdAt = createdAt;
             this.createdBy = createdBy;
-            this.configSnapshot = configSnapshot;
+            this.configJson = configJson;
             this.deleted = deleted;
             this.accessible = accessible;
         }
     }
 
-    static final class UserContext {
-        final String token;
-        final String username;
-        final Set<String> permissions;
+    // --------------------------- Audit Log Model ---------------------------
 
-        UserContext(String token, String username, Set<String> permissions) {
-            this.token = token;
-            this.username = username;
-            this.permissions = permissions;
-        }
-
-        boolean canRead(String appId) {
-            // For this simulation: any authenticated user with READ_VERSIONS can read any app.
-            return permissions.contains("READ_VERSIONS");
-        }
-
-        boolean canRestore(String appId) {
-            // For this simulation: permission RESTORE_VERSIONS is required.
-            return permissions.contains("RESTORE_VERSIONS");
-        }
-    }
-
-    static final class AuditEvent {
-        final Instant timestamp;
+    static final class AuditEntry {
+        final String auditId;
         final String appId;
-        final int versionNumber;
-        final String username;
-        final String status; // SUCCESS / FAILURE
+        final int restoredVersion;
+        final String user;
+        final OffsetDateTime timestamp;
+        final String status;
         final String failureReason;
 
-        AuditEvent(Instant timestamp, String appId, int versionNumber, String username, String status, String failureReason) {
-            this.timestamp = timestamp;
+        AuditEntry(String appId, int restoredVersion, String user, String status, String failureReason) {
+            this.auditId = UUID.randomUUID().toString();
             this.appId = appId;
-            this.versionNumber = versionNumber;
-            this.username = username;
+            this.restoredVersion = restoredVersion;
+            this.user = user;
+            this.timestamp = OffsetDateTime.now(ZoneOffset.UTC);
             this.status = status;
             this.failureReason = failureReason;
         }
     }
 
-    // ----------------------------
-    // Storage and concurrency
-    // ----------------------------
+    // --------------------------- In-memory Store ---------------------------
 
-    private final Map<String, App> apps = new ConcurrentHashMap<>();
-    private final Map<String, ReentrantLock> appLocks = new ConcurrentHashMap<>();
-    private final List<AuditEvent> auditLog = Collections.synchronizedList(new ArrayList<>());
+    static final class Store {
+        final Map<String, App> apps = new ConcurrentHashMap<>();
+        // appId -> versions
+        final Map<String, Map<Integer, AppVersion>> versions = new ConcurrentHashMap<>();
+        final List<AuditEntry> audit = java.util.Collections.synchronizedList(new ArrayList<>());
 
-    // Hardcoded "auth" token -> user
-    private final Map<String, UserContext> tokenToUser = Map.of(
-            "builder-token", new UserContext("builder-token", "builder", Set.of("READ_VERSIONS")),
-            "restorer-token", new UserContext("restorer-token", "restorer", Set.of("READ_VERSIONS", "RESTORE_VERSIONS")),
-            "admin-token", new UserContext("admin-token", "admin", Set.of("READ_VERSIONS", "RESTORE_VERSIONS"))
-    );
+        Optional<App> getApp(String appId) {
+            return Optional.ofNullable(apps.get(appId));
+        }
 
-    // ----------------------------
-    // Main
-    // ----------------------------
+        Optional<AppVersion> getVersion(String appId, int version) {
+            Map<Integer, AppVersion> map = versions.get(appId);
+            if (map == null) return Optional.empty();
+            return Optional.ofNullable(map.get(version));
+        }
+
+        List<AppVersion> listValidVersions(String appId) {
+            Map<Integer, AppVersion> map = versions.get(appId);
+            if (map == null) return List.of();
+            List<AppVersion> out = new ArrayList<>();
+            for (AppVersion v : map.values()) {
+                if (!v.deleted && v.accessible) out.add(v);
+            }
+            out.sort(Comparator.comparingInt((AppVersion v) -> v.versionNumber).reversed());
+            return out;
+        }
+
+        void addApp(App app) {
+            apps.put(app.appId, app);
+            versions.computeIfAbsent(app.appId, k -> new ConcurrentHashMap<>());
+        }
+
+        void addVersion(AppVersion v) {
+            versions.computeIfAbsent(v.appId, k -> new ConcurrentHashMap<>()).put(v.versionNumber, v);
+        }
+
+        void addAudit(AuditEntry e) {
+            audit.add(e);
+        }
+
+        List<AuditEntry> listAudit() {
+            synchronized (audit) {
+                return new ArrayList<>(audit);
+            }
+        }
+    }
+
+    // --------------------------- Auth Model ---------------------------
+
+    static final class UserContext {
+        final String username;
+        final Set<String> roles;
+
+        UserContext(String username, Set<String> roles) {
+            this.username = username;
+            this.roles = roles;
+        }
+
+        boolean isAuthenticated() {
+            return username != null && !username.isBlank();
+        }
+
+        boolean hasAnyRole(String... accepted) {
+            for (String a : accepted) {
+                if (roles.contains(a)) return true;
+            }
+            return false;
+        }
+    }
+
+    // --------------------------- Server ---------------------------
+
+    private final Store store;
+
+    AppVersionManagementServer(Store store) {
+        this.store = store;
+    }
 
     public static void main(String[] args) throws Exception {
         int port = 8080;
-        for (int i = 0; i < args.length; i++) {
-            if ("--port".equals(args[i]) && i + 1 < args.length) {
-                port = Integer.parseInt(args[++i]);
+        for (String a : args) {
+            if (a.startsWith("--port=")) {
+                port = Integer.parseInt(a.substring("--port=".length()));
             }
         }
 
-        AppVersionManagementBackend backend = new AppVersionManagementBackend();
-        backend.seedSampleData();
-        backend.startServer(port);
+        Store store = new Store();
+        seed(store);
 
-        System.out.println("Server started on http://localhost:" + port);
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/api/apps", new AppsHandler(store));
+        server.createContext("/api/audit", new AuditHandler(store));
+        server.createContext("/", new RootHandler());
+        server.setExecutor(Executors.newFixedThreadPool(Math.max(4, Runtime.getRuntime().availableProcessors())));
+        server.start();
+
+        System.out.println("AppVersionManagementServer started on http://localhost:" + port);
         System.out.println("Endpoints:");
         System.out.println("  GET  /api/apps/{appId}/versions");
         System.out.println("  POST /api/apps/{appId}/versions/{versionNumber}/restore");
-        System.out.println("Auth: Authorization: Bearer builder-token | restorer-token | admin-token");
+        System.out.println("  GET  /api/audit (demo: view restore audit entries)");
+        System.out.println();
+        System.out.println("Auth via headers (simulated):");
+        System.out.println("  X-User: <username>");
+        System.out.println("  X-Roles: APP_VIEWER,APP_RESTORER (or ADMIN)");
     }
 
-    private void startServer(int port) throws IOException {
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/api/apps", new AppsHandler(this));
-        server.setExecutor(Executors.newFixedThreadPool(Math.max(4, Runtime.getRuntime().availableProcessors())));
-        server.start();
+    private static void seed(Store s) {
+        // Demo data: one app with versions.
+        App app = new App("app-123", "{\"name\":\"Demo App\",\"widgets\":[\"A\"]}", 3);
+        s.addApp(app);
+
+        s.addVersion(new AppVersion("app-123", 1, OffsetDateTime.now(ZoneOffset.UTC).minusDays(10), "alice",
+                "{\"name\":\"Demo App\",\"widgets\":[\"A\"]}", false, true));
+        s.addVersion(new AppVersion("app-123", 2, OffsetDateTime.now(ZoneOffset.UTC).minusDays(5), "bob",
+                "{\"name\":\"Demo App\",\"widgets\":[\"A\",\"B\"]}", false, true));
+        s.addVersion(new AppVersion("app-123", 3, OffsetDateTime.now(ZoneOffset.UTC).minusDays(1), "carol",
+                "{\"name\":\"Demo App\",\"widgets\":[\"A\",\"B\",\"C\"]}", false, true));
+
+        // A deleted/inaccessible version to demonstrate exclusion
+        s.addVersion(new AppVersion("app-123", 99, OffsetDateTime.now(ZoneOffset.UTC).minusDays(2), "mallory",
+                "{\"name\":\"Bad Version\"}", true, false));
+
+        // Another app with no versions besides active (for "no versions" scenario we keep none)
+        s.addApp(new App("empty-app", "{\"name\":\"Empty\"}", 0));
     }
 
-    private void seedSampleData() {
-        // App A with versions 1..3
-        App a = new App("appA");
-        a.versionsByNumber.put(1, new Version(1, Instant.parse("2025-01-10T10:15:30Z"), "builder", "{\"flow\":\"v1\"}", false, true));
-        a.versionsByNumber.put(2, new Version(2, Instant.parse("2025-02-05T09:05:00Z"), "builder", "{\"flow\":\"v2\"}", false, true));
-        a.versionsByNumber.put(3, new Version(3, Instant.parse("2025-03-12T18:22:10Z"), "restorer", "{\"flow\":\"v3\"}", false, true));
-        a.activeVersion = 3;
-        a.activeConfig = a.versionsByNumber.get(3).configSnapshot;
+    // --------------------------- Handlers ---------------------------
 
-        // App B with one inaccessible version and one valid
-        App b = new App("appB");
-        b.versionsByNumber.put(1, new Version(1, Instant.parse("2025-01-01T00:00:00Z"), "builder", "{\"cfg\":\"b1\"}", false, false));
-        b.versionsByNumber.put(2, new Version(2, Instant.parse("2025-04-01T00:00:00Z"), "admin", "{\"cfg\":\"b2\"}", false, true));
-        b.activeVersion = 2;
-        b.activeConfig = b.versionsByNumber.get(2).configSnapshot;
-
-        apps.put(a.appId, a);
-        apps.put(b.appId, b);
+    static final class RootHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange ex) throws IOException {
+            String body = "{" +
+                    "\"name\":\"AppVersionManagementServer\"," +
+                    "\"workItem\":104470," +
+                    "\"endpoints\":[\"GET /api/apps/{appId}/versions\",\"POST /api/apps/{appId}/versions/{versionNumber}/restore\"]" +
+                    "}";
+            writeJson(ex, 200, body);
+        }
     }
 
-    // ----------------------------
-    // HTTP Handler
-    // ----------------------------
+    static final class AuditHandler implements HttpHandler {
+        private final Store store;
 
-    static final class AppsHandler implements HttpHandler {
-        private final AppVersionManagementBackend backend;
-
-        AppsHandler(AppVersionManagementBackend backend) {
-            this.backend = backend;
+        AuditHandler(Store store) {
+            this.store = store;
         }
 
         @Override
         public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                sendError(ex, 405, "METHOD_NOT_ALLOWED", "Only GET is supported");
+                return;
+            }
+            List<Map<String, Object>> data = new ArrayList<>();
+            for (AuditEntry e : store.listAudit()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("auditId", e.auditId);
+                m.put("appId", e.appId);
+                m.put("restoredVersion", e.restoredVersion);
+                m.put("user", e.user);
+                m.put("timestamp", e.timestamp.toString());
+                m.put("status", e.status);
+                if (e.failureReason != null) m.put("failureReason", e.failureReason);
+                data.add(m);
+            }
+            ApiResponse resp = ApiResponse.ok("Audit entries", data);
+            writeApiResponse(ex, 200, resp);
+        }
+    }
+
+    static final class AppsHandler implements HttpHandler {
+        private final Store store;
+
+        AppsHandler(Store store) {
+            this.store = store;
+        }
+
+        @Override
+        public void handle(HttpExchange ex) throws IOException {
+            // Expected patterns:
+            // /api/apps/{appId}/versions
+            // /api/apps/{appId}/versions/{versionNumber}/restore
+            String path = ex.getRequestURI().getPath();
+            // remove leading "/api/apps"
+            String rest = path.substring("/api/apps".length());
+            if (rest.isEmpty() || "/".equals(rest)) {
+                sendError(ex, 404, "NOT_FOUND", "Unknown endpoint");
+                return;
+            }
+
+            // Split, ignoring leading slash
+            String[] parts = rest.startsWith("/") ? rest.substring(1).split("/") : rest.split("/");
+            // parts[0]=appId
+            if (parts.length < 2) {
+                sendError(ex, 404, "NOT_FOUND", "Unknown endpoint");
+                return;
+            }
+
+            String appId = parts[0];
+            String second = parts[1];
+
+            if (!"versions".equals(second)) {
+                sendError(ex, 404, "NOT_FOUND", "Unknown endpoint");
+                return;
+            }
+
+            if ("GET".equalsIgnoreCase(ex.getRequestMethod()) && parts.length == 2) {
+                handleGetVersions(ex, appId);
+                return;
+            }
+
+            if ("POST".equalsIgnoreCase(ex.getRequestMethod()) && parts.length == 4 && "restore".equals(parts[3])) {
+                int version;
+                try {
+                    version = Integer.parseInt(parts[2]);
+                } catch (NumberFormatException nfe) {
+                    sendError(ex, 400, "INVALID_VERSION", "versionNumber must be an integer");
+                    return;
+                }
+                handleRestore(ex, appId, version);
+                return;
+            }
+
+            sendError(ex, 404, "NOT_FOUND", "Unknown endpoint");
+        }
+
+        private void handleGetVersions(HttpExchange ex, String appId) throws IOException {
+            UserContext user = parseUser(ex.getRequestHeaders());
+            if (!user.isAuthenticated()) {
+                sendError(ex, 401, "UNAUTHORIZED", "Missing X-User header");
+                return;
+            }
+            if (!user.hasAnyRole("APP_VIEWER", "ADMIN")) {
+                sendError(ex, 403, "FORBIDDEN", "User is not permitted to view application versions");
+                return;
+            }
+
+            App app = store.getApp(appId).orElse(null);
+            if (app == null) {
+                sendError(ex, 404, "APP_NOT_FOUND", "Application does not exist for appId=" + appId);
+                return;
+            }
+
+            // Read lock for consistency while listing
+            app.lock.readLock().lock();
             try {
-                String method = ex.getRequestMethod().toUpperCase(Locale.ROOT);
-                URI uri = ex.getRequestURI();
-                String path = uri.getPath();
-
-                // Expected patterns:
-                // /api/apps/{appId}/versions
-                // /api/apps/{appId}/versions/{versionNumber}/restore
-
-                List<String> parts = splitPath(path);
-                // parts for "/api/apps/..." => [api, apps, ...]
-                if (parts.size() < 4 || !"api".equals(parts.get(0)) || !"apps".equals(parts.get(1))) {
-                    sendJson(ex, 404, error("NOT_FOUND", "Unknown endpoint", Map.of("path", path)));
-                    return;
+                List<AppVersion> versions = store.listValidVersions(appId);
+                List<Map<String, Object>> out = new ArrayList<>();
+                for (AppVersion v : versions) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("versionNumber", v.versionNumber);
+                    m.put("createdAt", v.createdAt.toString());
+                    m.put("createdBy", v.createdBy);
+                    m.put("active", v.versionNumber == app.activeVersion);
+                    // "Any other supported metadata" - keep minimal, but include flags for transparency
+                    m.put("deleted", v.deleted);
+                    m.put("accessible", v.accessible);
+                    out.add(m);
                 }
 
-                String appId = parts.get(2);
-                String segment = parts.get(3);
-                if (!"versions".equals(segment)) {
-                    sendJson(ex, 404, error("NOT_FOUND", "Unknown endpoint", Map.of("path", path)));
-                    return;
+                if (out.isEmpty()) {
+                    ApiResponse resp = ApiResponse.ok("No versions available for application", List.of());
+                    writeApiResponse(ex, 200, resp);
+                } else {
+                    ApiResponse resp = ApiResponse.ok("Versions retrieved", out);
+                    writeApiResponse(ex, 200, resp);
                 }
-
-                if ("GET".equals(method) && parts.size() == 4) {
-                    backend.handleGetVersions(ex, appId);
-                    return;
-                }
-
-                if ("POST".equals(method) && parts.size() == 6 && "restore".equals(parts.get(5))) {
-                    String versionStr = parts.get(4);
-                    backend.handleRestore(ex, appId, versionStr);
-                    return;
-                }
-
-                sendJson(ex, 405, error("METHOD_NOT_ALLOWED", "Method/path not supported", Map.of("method", method, "path", path)));
-            } catch (Exception e) {
-                sendJson(ex, 500, error("INTERNAL_ERROR", "Unexpected server error", Map.of("exception", e.getClass().getName(), "message", safeMsg(e))));
             } finally {
-                ex.close();
+                app.lock.readLock().unlock();
             }
         }
 
-        private static List<String> splitPath(String path) {
-            String[] raw = path.split("/");
-            List<String> parts = new ArrayList<>();
-            for (String r : raw) {
-                if (!r.isEmpty()) parts.add(r);
+        private void handleRestore(HttpExchange ex, String appId, int versionNumber) throws IOException {
+            UserContext user = parseUser(ex.getRequestHeaders());
+            if (!user.isAuthenticated()) {
+                sendError(ex, 401, "UNAUTHORIZED", "Missing X-User header");
+                return;
             }
-            return parts;
-        }
+            if (!user.hasAnyRole("APP_RESTORER", "ADMIN")) {
+                sendError(ex, 403, "FORBIDDEN", "User is not permitted to restore application versions");
+                return;
+            }
 
-        private static String safeMsg(Throwable t) {
-            String m = t.getMessage();
-            return m == null ? "" : m;
-        }
-    }
+            App app = store.getApp(appId).orElse(null);
+            if (app == null) {
+                // audit failed attempt
+                store.addAudit(new AuditEntry(appId, versionNumber, user.username, "FAILED", "APP_NOT_FOUND"));
+                sendError(ex, 404, "APP_NOT_FOUND", "Application does not exist for appId=" + appId);
+                return;
+            }
 
-    // ----------------------------
-    // Endpoint Implementations
-    // ----------------------------
+            if (versionNumber <= 0) {
+                store.addAudit(new AuditEntry(appId, versionNumber, user.username, "FAILED", "INVALID_VERSION_NUMBER"));
+                sendError(ex, 400, "INVALID_VERSION", "versionNumber must be a positive integer");
+                return;
+            }
 
-    private void handleGetVersions(HttpExchange ex, String appId) throws IOException {
-        Optional<UserContext> userOpt = authenticate(ex);
-        if (userOpt.isEmpty()) {
-            sendJson(ex, 401, error("UNAUTHORIZED", "Missing or invalid Authorization header", Map.of()));
-            return;
-        }
-        UserContext user = userOpt.get();
-        if (!user.canRead(appId)) {
-            sendJson(ex, 403, error("FORBIDDEN", "User not authorized to view versions", Map.of("appId", appId)));
-            return;
-        }
+            Optional<AppVersion> maybeVersion = store.getVersion(appId, versionNumber);
+            if (maybeVersion.isEmpty()) {
+                store.addAudit(new AuditEntry(appId, versionNumber, user.username, "FAILED", "VERSION_NOT_FOUND"));
+                sendError(ex, 404, "VERSION_NOT_FOUND", "Version does not exist for application");
+                return;
+            }
 
-        App app = apps.get(appId);
-        if (app == null) {
-            sendJson(ex, 404, error("APP_NOT_FOUND", "Application does not exist", Map.of("appId", appId)));
-            return;
-        }
+            AppVersion v = maybeVersion.get();
 
-        List<Version> versions = new ArrayList<>();
-        for (Version v : app.versionsByNumber.values()) {
-            if (v.deleted) continue;
-            if (!v.accessible) continue;
-            versions.add(v);
-        }
-        versions.sort(Comparator.comparingInt((Version v) -> v.versionNumber).reversed());
+            // Relationship check (explicit in AC #6)
+            if (!Objects.equals(v.appId, appId)) {
+                store.addAudit(new AuditEntry(appId, versionNumber, user.username, "FAILED", "INVALID_APP_VERSION_RELATION"));
+                sendError(ex, 400, "INVALID_RELATION", "Invalid version/application relationship");
+                return;
+            }
 
-        if (versions.isEmpty()) {
-            // Requirement: "Return an appropriate response when no versions are available."
-            // Assumption: return 200 with empty list and a message.
-            sendJson(ex, 200, ok(Map.of(
-                    "appId", appId,
-                    "versions", List.of(),
-                    "message", "No versions available"
-            )));
-            return;
-        }
+            if (v.deleted || !v.accessible) {
+                store.addAudit(new AuditEntry(appId, versionNumber, user.username, "FAILED", "VERSION_INACCESSIBLE"));
+                sendError(ex, 409, "VERSION_INACCESSIBLE", "Prevented restoration of an invalid or inaccessible version");
+                return;
+            }
 
-        List<Object> out = new ArrayList<>();
-        for (Version v : versions) {
-            out.add(Map.of(
-                    "versionNumber", v.versionNumber,
-                    "createdAt", v.createdAt.toString(),
-                    "createdBy", v.createdBy,
-                    "isActive", v.versionNumber == app.activeVersion
-            ));
-        }
-
-        sendJson(ex, 200, ok(Map.of(
-                "appId", appId,
-                "activeVersion", app.activeVersion,
-                "versions", out
-        )));
-    }
-
-    private void handleRestore(HttpExchange ex, String appId, String versionStr) throws IOException {
-        Optional<UserContext> userOpt = authenticate(ex);
-        if (userOpt.isEmpty()) {
-            sendJson(ex, 401, error("UNAUTHORIZED", "Missing or invalid Authorization header", Map.of()));
-            return;
-        }
-        UserContext user = userOpt.get();
-
-        App app = apps.get(appId);
-        if (app == null) {
-            audit(appId, -1, user.username, "FAILURE", "APP_NOT_FOUND");
-            sendJson(ex, 404, error("APP_NOT_FOUND", "Application does not exist", Map.of("appId", appId)));
-            return;
-        }
-
-        if (!user.canRestore(appId)) {
-            audit(appId, parseIntOrNeg(versionStr), user.username, "FAILURE", "FORBIDDEN");
-            sendJson(ex, 403, error("FORBIDDEN", "User not authorized to restore versions", Map.of("appId", appId)));
-            return;
-        }
-
-        int versionNumber;
-        try {
-            versionNumber = Integer.parseInt(versionStr);
-        } catch (NumberFormatException nfe) {
-            audit(appId, -1, user.username, "FAILURE", "INVALID_VERSION_NUMBER");
-            sendJson(ex, 400, error("BAD_REQUEST", "versionNumber must be an integer", Map.of("versionNumber", versionStr)));
-            return;
-        }
-
-        Version target = app.versionsByNumber.get(versionNumber);
-        if (target == null) {
-            audit(appId, versionNumber, user.username, "FAILURE", "VERSION_NOT_FOUND");
-            sendJson(ex, 404, error("VERSION_NOT_FOUND", "Version does not exist for application", Map.of("appId", appId, "versionNumber", versionNumber)));
-            return;
-        }
-
-        if (target.deleted || !target.accessible) {
-            audit(appId, versionNumber, user.username, "FAILURE", "VERSION_INACCESSIBLE");
-            sendJson(ex, 409, error("VERSION_INACCESSIBLE", "Cannot restore an invalid or inaccessible version", Map.of("appId", appId, "versionNumber", versionNumber)));
-            return;
-        }
-
-        // Concurrency: prevent concurrent restore operations safely.
-        ReentrantLock lock = appLocks.computeIfAbsent(appId, k -> new ReentrantLock());
-        if (!lock.tryLock()) {
-            audit(appId, versionNumber, user.username, "FAILURE", "RESTORE_CONFLICT");
-            sendJson(ex, 409, error("RESTORE_CONFLICT", "Another restore operation is in progress", Map.of("appId", appId)));
-            return;
-        }
-
-        try {
-            // Transactional-ish restore: stage changes then commit.
-            int oldActiveVersion = app.activeVersion;
-            String oldActiveConfig = app.activeConfig;
-
+            // Transactional restore: take write lock, snapshot current state, apply, rollback on failure.
+            boolean restored = false;
+            String failure = null;
+            app.lock.writeLock().lock();
             try {
-                // Simulate potential failure if header provided (useful for QA).
-                // Not required by story; kept minimal. If not present, behaves normally.
-                String failHeader = header(ex.getRequestHeaders(), "X-Simulate-Failure").orElse("");
-                if ("true".equalsIgnoreCase(failHeader)) {
-                    throw new RuntimeException("Simulated restore failure");
+                // Conflict rule: if already active, treat as conflict (4xx) to satisfy "conflict" scenario.
+                if (app.activeVersion == versionNumber) {
+                    failure = "VERSION_ALREADY_ACTIVE";
+                    sendError(ex, 409, "RESTORE_CONFLICT", "Requested version is already active");
+                    return;
                 }
 
-                // Restore all required components/configurations consistently.
-                // Here represented by configSnapshot.
-                String newConfig = target.configSnapshot;
+                String prevConfig = app.activeConfigJson;
+                int prevActive = app.activeVersion;
 
-                // Commit
-                app.activeConfig = newConfig;
-                app.activeVersion = versionNumber;
+                try {
+                    // Restore components/config consistently: here it's the whole config blob.
+                    app.activeConfigJson = v.configJson;
+                    app.activeVersion = v.versionNumber;
 
-                audit(appId, versionNumber, user.username, "SUCCESS", null);
-                sendJson(ex, 200, ok(Map.of(
-                        "appId", appId,
-                        "restoredVersion", versionNumber,
-                        "activeVersion", app.activeVersion,
-                        "message", "Restore completed"
-                )));
-            } catch (Exception restoreFailure) {
-                // Rollback to ensure not partially restored.
-                app.activeVersion = oldActiveVersion;
-                app.activeConfig = oldActiveConfig;
+                    // Simulate an unexpected restoration failure if request includes header:
+                    // X-Debug-Fail-Restore: true
+                    // (Useful to show rollback property in a runnable demo.)
+                    String debugFail = ex.getRequestHeaders().getFirst("X-Debug-Fail-Restore");
+                    if (debugFail != null && debugFail.equalsIgnoreCase("true")) {
+                        throw new RuntimeException("Simulated restore failure");
+                    }
 
-                audit(appId, versionNumber, user.username, "FAILURE", restoreFailure.getMessage());
-                sendJson(ex, 500, error("RESTORE_FAILED", "Unexpected restoration failure", Map.of(
-                        "appId", appId,
-                        "versionNumber", versionNumber,
-                        "details", safeMsg(restoreFailure)
-                )));
-            }
-        } finally {
-            lock.unlock();
-        }
-    }
+                    restored = true;
+                } catch (Exception e) {
+                    // Rollback
+                    app.activeConfigJson = prevConfig;
+                    app.activeVersion = prevActive;
+                    failure = "RESTORE_FAILED: " + e.getMessage();
+                    sendError(ex, 500, "RESTORE_FAILED", "Unexpected restoration failure");
+                    return;
+                }
 
-    // ----------------------------
-    // Auth + helpers
-    // ----------------------------
-
-    private Optional<UserContext> authenticate(HttpExchange ex) {
-        Optional<String> auth = header(ex.getRequestHeaders(), "Authorization");
-        if (auth.isEmpty()) return Optional.empty();
-        String v = auth.get().trim();
-        if (!v.toLowerCase(Locale.ROOT).startsWith("bearer ")) return Optional.empty();
-        String token = v.substring("bearer ".length()).trim();
-        return Optional.ofNullable(tokenToUser.get(token));
-    }
-
-    private static Optional<String> header(Headers headers, String name) {
-        for (Map.Entry<String, List<String>> e : headers.entrySet()) {
-            if (e.getKey() != null && e.getKey().equalsIgnoreCase(name)) {
-                List<String> vals = e.getValue();
-                if (vals != null && !vals.isEmpty()) {
-                    return Optional.ofNullable(vals.get(0));
+            } finally {
+                app.lock.writeLock().unlock();
+                // Audit must record status whether success or failure (requirement).
+                if (restored) {
+                    store.addAudit(new AuditEntry(appId, versionNumber, user.username, "SUCCESS", null));
+                } else if (failure != null) {
+                    store.addAudit(new AuditEntry(appId, versionNumber, user.username, "FAILED", failure));
                 }
             }
-        }
-        return Optional.empty();
-    }
 
-    private void audit(String appId, int versionNumber, String username, String status, String failureReason) {
-        auditLog.add(new AuditEvent(Instant.now(), appId, versionNumber, username, status, failureReason));
-        // Minimal logging to stdout as per "Audit & Logging" requirement.
-        System.out.println("AUDIT {" +
-                "ts=\"" + Instant.now() + "\"," +
-                " appId=\"" + appId + "\"," +
-                " version=" + versionNumber + "," +
-                " user=\"" + username + "\"," +
-                " status=\"" + status + "\"," +
-                " failureReason=\"" + (failureReason == null ? "" : failureReason.replace("\"", "'")) + "\"" +
-                " }");
-    }
+            Map<String, Object> respData = new LinkedHashMap<>();
+            respData.put("appId", appId);
+            respData.put("activeVersion", versionNumber);
+            respData.put("message", "Application restored successfully");
 
-    private static int parseIntOrNeg(String s) {
-        try {
-            return Integer.parseInt(s);
-        } catch (Exception e) {
-            return -1;
+            ApiResponse resp = ApiResponse.ok("Restore completed", respData);
+            writeApiResponse(ex, 200, resp);
         }
     }
 
-    // ----------------------------
-    // JSON response helpers
-    // ----------------------------
+    // --------------------------- Utilities ---------------------------
 
-    private static Map<String, Object> ok(Map<String, Object> data) {
-        Map<String, Object> m = new HashMap<>();
-        m.put("status", "success");
-        m.put("data", data);
-        return m;
+    static UserContext parseUser(Headers headers) {
+        String user = Optional.ofNullable(headers.getFirst("X-User")).orElse("").trim();
+        String rolesHeader = Optional.ofNullable(headers.getFirst("X-Roles")).orElse("").trim();
+        Set<String> roles = java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+        if (!rolesHeader.isBlank()) {
+            Arrays.stream(rolesHeader.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isBlank())
+                    .map(s -> s.toUpperCase(Locale.ROOT))
+                    .forEach(roles::add);
+        }
+
+        return new UserContext(user, roles);
     }
 
-    private static Map<String, Object> error(String code, String message, Map<String, Object> details) {
-        Map<String, Object> err = new HashMap<>();
-        err.put("status", "error");
-        err.put("message", message);
-        err.put("error", Map.of(
-                "code", code,
-                "details", details == null ? Map.of() : details
-        ));
-        return err;
+    static void sendError(HttpExchange ex, int status, String code, String details) throws IOException {
+        ErrorDetails err = new ErrorDetails(status, code, details);
+        ApiResponse resp = ApiResponse.fail("Request failed", err);
+        writeApiResponse(ex, status, resp);
     }
 
-    private static void sendJson(HttpExchange ex, int statusCode, Map<String, Object> body) throws IOException {
-        byte[] bytes = toJson(body).getBytes(StandardCharsets.UTF_8);
+    static void writeApiResponse(HttpExchange ex, int status, ApiResponse resp) throws IOException {
+        String json = toJson(resp);
+        writeJson(ex, status, json);
+    }
+
+    static void writeJson(HttpExchange ex, int status, String body) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-        ex.sendResponseHeaders(statusCode, bytes.length);
+        ex.sendResponseHeaders(status, bytes.length);
         try (OutputStream os = ex.getResponseBody()) {
             os.write(bytes);
         }
     }
 
-    // Minimal JSON serializer for Maps/Lists/Strings/Numbers/Booleans/null.
-    private static String toJson(Object o) {
+    // Minimal JSON writer (no dependencies). Handles Maps/Lists/Strings/Numbers/booleans/null and simple POJOs in this file.
+    static String toJson(Object o) {
         if (o == null) return "null";
-        if (o instanceof String s) return "\"" + escapeJson(s) + "\"";
+        if (o instanceof String s) return '"' + escapeJson(s) + '"';
         if (o instanceof Number || o instanceof Boolean) return o.toString();
-        if (o instanceof Map<?, ?> map) {
+        if (o instanceof Instant i) return '"' + i.toString() + '"';
+        if (o instanceof OffsetDateTime odt) return '"' + odt.toString() + '"';
+        if (o instanceof Map<?, ?> m) {
             StringBuilder sb = new StringBuilder();
             sb.append('{');
             boolean first = true;
-            for (Map.Entry<?, ?> e : map.entrySet()) {
-                Object k = e.getKey();
-                if (!(k instanceof String)) continue;
+            for (Map.Entry<?, ?> e : m.entrySet()) {
                 if (!first) sb.append(',');
                 first = false;
-                sb.append(toJson(k));
+                sb.append(toJson(Objects.toString(e.getKey())));
                 sb.append(':');
                 sb.append(toJson(e.getValue()));
             }
@@ -525,19 +608,37 @@ class AppVersionManagementBackend {
             StringBuilder sb = new StringBuilder();
             sb.append('[');
             boolean first = true;
-            for (Object v : list) {
+            for (Object e : list) {
                 if (!first) sb.append(',');
                 first = false;
-                sb.append(toJson(v));
+                sb.append(toJson(e));
             }
             sb.append(']');
             return sb.toString();
         }
+
+        // Serialize known objects
+        if (o instanceof ApiResponse r) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("success", r.success);
+            m.put("message", r.message);
+            m.put("data", r.data);
+            m.put("timestamp", r.timestamp.toString());
+            if (r.error != null) {
+                Map<String, Object> em = new LinkedHashMap<>();
+                em.put("status", r.error.status);
+                em.put("code", r.error.code);
+                em.put("details", r.error.details);
+                m.put("error", em);
+            }
+            return toJson(m);
+        }
+
         // Fallback to string
-        return toJson(String.valueOf(o));
+        return '"' + escapeJson(o.toString()) + '"';
     }
 
-    private static String escapeJson(String s) {
+    static String escapeJson(String s) {
         StringBuilder sb = new StringBuilder(s.length() + 16);
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
