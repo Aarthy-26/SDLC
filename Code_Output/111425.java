@@ -1,417 +1,222 @@
+package com.ascendion.datapowerAI;
+
 /*
- * Work Item: 111425 (User Story)
- * Title: Implement Comprehensive Unit Test Coverage for All Controller and Service Classes
- *
- * IMPORTANT DELIVERY CONSTRAINT
- * ----------------------------
- * The user story asks for comprehensive JUnit tests across *many* controller/service classes
- * (plus coverage reporting). However, this agent run is constrained to output EXACTLY ONE
- * Java source file. Creating the required test suite would necessarily span multiple files
- * under src/test/java and cannot be fully delivered as a single Java file.
- *
- * Closest-useful single-file deliverable
- * -------------------------------------
- * This standalone Java 26 program scans a checked-out Spring Boot codebase and produces:
- *   1) Inventory/checklist of all Controller and Service classes (AC1).
- *   2) Suggested test-class names/paths that mirror package structure.
- *   3) A "completion report" style summary (counts, exclusions, notes).
- *
- * It does NOT modify the repository, does NOT generate multiple test files, and does NOT
- * fabricate coverage numbers (AC9). It is deterministic and offline.
- *
- * Usage
- * -----
- *   javac 111425.java
- *   java Requirement111425TestInventory /path/to/aava-ds-datapowerai-api
- *
- * Optional flags:
- *   --excludeTestFrameworks   Ignore files under src/test/java (default true).
- *   --includeInnerClasses     Attempt to detect inner @RestController classes (default false).
- *   --json                    Emit machine-readable JSON instead of text.
- *
- * Notes on repo conventions detected from scan (typical for this repo):
- *   - Controllers under: src/main/java/.../controller
- *   - Services under:     src/main/java/.../service and .../service/implementation
- *   - Spring annotations: @RestController, @Controller, @Service
- */
+Story ID: 111425
+Title: Implement Comprehensive Unit Test Coverage for All Controller and Service Classes
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.FileVisitResult;
-import java.nio.file.FileVisitor;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.EnumSet;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+What this file does:
+Generates a repo-style Spring component that inventories controller and service classes from the provided repository snapshot,
+maps them to recommended test classes, highlights framework conventions to reuse, and produces a completion report model
+for planning comprehensive JUnit coverage work without changing production behavior.
 
-class Requirement111425TestInventory {
+Assumptions:
+- The work item describes a testing initiative rather than a single directly buildable production feature, so this file builds
+  the closest useful in-repo tool: a coverage planning/report generator component.
+- Azure DevOps comments, attachments, and linked-item details were not returned by the work item reader; this implementation
+  uses the returned fields, description, acceptance criteria, and repository snapshot.
+- Repo snapshot shows Spring Boot conventions, package com.ascendion.datapowerAI, JPA persistence, ApiResponseGenric/
+  ApiResponseUtil response wrapping, custom @PreAuthorize(RoleType.*), GlobalExceptionHandlerDpai, and controller/service
+  separation; those conventions are mirrored here.
+- Latest returned requirement text was used; no newer contradicting comments were available in the tool output.
+*/
+class ComprehensiveTestCoveragePlanner {
 
-    private static final String DEFAULT_SRC_MAIN = "src/main/java";
+    static final String REQUIREMENT_SUMMARY = """
+            Missing work item sections: discussion/comments, attachments, related work items/links, repro steps/system info/custom template fields were not returned by the tool.
+            Repo scan summary: Spring Boot app in package com.ascendion.datapowerAI; controllers under controller; services under service, service.datasource, service.implementation; DTO wrapper ApiResponseGenric and helper ApiResponseUtil; authorization via @PreAuthorize(RoleType.*); exception handling via GlobalExceptionHandlerDpai; persistence primarily JPA repositories with some JdbcTemplate usage; helper/strategy patterns include DuplicateNameGenerator, import/export strategies, payload builders, and resource binding helpers.
+            Conflict note: the story asks for comprehensive JUnit tests across the codebase, but this task allows exactly one Java file only, so this file provides a maintainable in-repo planner/report generator rather than fabricating hundreds of test classes.
+            """;
 
-    // Fast heuristic patterns (keep simple; no external deps).
-    private static final Pattern PACKAGE_PATTERN = Pattern.compile("^\\s*package\\s+([a-zA-Z0-9_.$]+)\\s*;\\s*$");
-    private static final Pattern CLASS_PATTERN = Pattern.compile("^\\s*(public\\s+)?(abstract\\s+)?(final\\s+)?(class|interface|record|enum)\\s+([A-Za-z0-9_]+)\\b");
-
-    private static final Pattern SPRING_ANNOTATION_CONTROLLER = Pattern.compile("@RestController\\b|@Controller\\b");
-    private static final Pattern SPRING_ANNOTATION_SERVICE = Pattern.compile("@Service\\b");
-
-    // Exclude generated/irrelevant
-    private static final Pattern EXCLUDE_PATH_PATTERN = Pattern.compile("/target/|/build/|/.git/|/.idea/|/out/|/node_modules/", Pattern.CASE_INSENSITIVE);
-
-    enum Kind {
-        CONTROLLER,
-        SERVICE
+    static PlanningReport generateReport() {
+        Inventory inventory = buildInventory();
+        ConventionScan conventions = buildConventions();
+        CompletionReport completion = buildCompletion(inventory);
+        return new PlanningReport("111425", "Implement Comprehensive Unit Test Coverage for All Controller and Service Classes", conventions, inventory, completion);
     }
 
-    static final class Entry {
-        final Kind kind;
-        final Path file;
-        final String pkg;
-        final String typeName;
-        final boolean springAnnotated;
-
-        Entry(Kind kind, Path file, String pkg, String typeName, boolean springAnnotated) {
-            this.kind = kind;
-            this.file = file;
-            this.pkg = pkg;
-            this.typeName = typeName;
-            this.springAnnotated = springAnnotated;
-        }
-
-        String fqcn() {
-            if (pkg == null || pkg.isBlank()) return typeName;
-            return pkg + "." + typeName;
-        }
-
-        String suggestedTestFqcn() {
-            String suffix = "Test";
-            return fqcn() + suffix;
-        }
-
-        String suggestedTestPath() {
-            // Mirror packages under src/test/java
-            String rel = (pkg == null ? "" : pkg.replace('.', '/'));
-            if (!rel.isBlank()) rel = rel + "/";
-            return "src/test/java/" + rel + typeName + "Test.java";
-        }
+    private static ConventionScan buildConventions() {
+        return new ConventionScan(
+                "com.ascendion.datapowerAI",
+                "ApiResponseGenric",
+                "ApiResponseUtil",
+                "GlobalExceptionHandlerDpai",
+                List.of("@PreAuthorize(RoleType.TOOL_ADMIN)", "@PreAuthorize(RoleType.USER)", "@PreAuthorize(RoleType.APP_VIEWER)", "@PreAuthorize(RoleType.APP_EDITOR)"),
+                "JPA repositories plus selective JdbcTemplate/NamedParameterJdbcTemplate services",
+                List.of("DuplicateNameGenerator", "AppImportStrategyFactory", "JsonPayloadBuilder", "MultipartPayloadBuilder", "ResourceBindingExportService", "ResourceBindingImportService")
+        );
     }
 
-    static final class ScanResult {
-        final List<Entry> controllers = new ArrayList<>();
-        final List<Entry> services = new ArrayList<>();
-        final List<String> exclusions = new ArrayList<>();
-        final Map<String, Object> meta = new LinkedHashMap<>();
+    private static Inventory buildInventory() {
+        List<ClassPlan> controllers = List.of(
+                plan("AavaAuthController", Layer.CONTROLLER),
+                plan("ApiBaseUrlController", Layer.CONTROLLER),
+                plan("ApiExportController", Layer.CONTROLLER),
+                plan("ApiImportController", Layer.CONTROLLER),
+                plan("AppController", Layer.CONTROLLER),
+                plan("AppImportExportController", Layer.CONTROLLER),
+                plan("AppNoteController", Layer.CONTROLLER),
+                plan("AppPageController", Layer.CONTROLLER),
+                plan("AppQueryStoreController", Layer.CONTROLLER),
+                plan("AppTableController", Layer.CONTROLLER),
+                plan("AppTableRowController", Layer.CONTROLLER),
+                plan("AppUserController", Layer.CONTROLLER),
+                plan("AppVersionController", Layer.CONTROLLER),
+                plan("AppsAPIController", Layer.CONTROLLER),
+                plan("AsyncApiConfigController", Layer.CONTROLLER),
+                plan("AsyncJobController", Layer.CONTROLLER),
+                plan("AsyncJobDataSyncConfigurationController", Layer.CONTROLLER),
+                plan("AuthController", Layer.CONTROLLER),
+                plan("ConnectionPropertyValueController", Layer.CONTROLLER),
+                plan("DataSourceCategoryController", Layer.CONTROLLER),
+                plan("DataSourceConnectionController", Layer.CONTROLLER),
+                plan("DataSourceTypeController", Layer.CONTROLLER),
+                plan("FolderController", Layer.CONTROLLER),
+                plan("GenericQueryController", Layer.CONTROLLER),
+                plan("GlobalComponentController", Layer.CONTROLLER),
+                plan("PageActionController", Layer.CONTROLLER),
+                plan("PageComponentController", Layer.CONTROLLER),
+                plan("PageExportController", Layer.CONTROLLER),
+                plan("PageImportController", Layer.CONTROLLER),
+                plan("PredefinedAPIController", Layer.CONTROLLER),
+                plan("ProjectController", Layer.CONTROLLER),
+                plan("PropertyDefController", Layer.CONTROLLER),
+                plan("QueryStoreController", Layer.CONTROLLER),
+                plan("RoleController", Layer.CONTROLLER),
+                plan("ThemeController", Layer.CONTROLLER),
+                plan("UserController", Layer.CONTROLLER),
+                plan("WhitelistController", Layer.CONTROLLER)
+        );
 
-        int total() {
-            return controllers.size() + services.size();
-        }
+        List<ClassPlan> services = List.of(
+                plan("APIExecutionService", Layer.SERVICE),
+                plan("AavaAuthService", Layer.SERVICE),
+                plan("ApiBaseUrlService", Layer.SERVICE),
+                plan("ApiExportService", Layer.SERVICE),
+                plan("ApiImportService", Layer.SERVICE),
+                plan("AppExportService", Layer.SERVICE),
+                plan("AppImportService", Layer.SERVICE),
+                plan("AppNoteService", Layer.SERVICE),
+                plan("AppPageService", Layer.SERVICE),
+                plan("AppQueryStoreService", Layer.SERVICE),
+                plan("AppResponseAssembler", Layer.SERVICE),
+                plan("AppService", Layer.SERVICE),
+                plan("AppThemeService", Layer.SERVICE),
+                plan("AppUserService", Layer.SERVICE),
+                plan("AppVersionService", Layer.SERVICE),
+                plan("AsyncApiConfigService", Layer.SERVICE),
+                plan("AsyncJobDataSyncScheduler", Layer.SERVICE),
+                plan("AsyncJobDataSyncService", Layer.SERVICE),
+                plan("AsyncJobProcessor", Layer.SERVICE),
+                plan("AsyncJobService", Layer.SERVICE),
+                plan("AsyncOrchestratorService", Layer.SERVICE),
+                plan("AuditSqlEnricher", Layer.SERVICE),
+                plan("AuthFlowService", Layer.SERVICE),
+                plan("AuthService", Layer.SERVICE),
+                plan("ExternalAsyncJobProcessor", Layer.SERVICE),
+                plan("ExternalAsyncPollingService", Layer.SERVICE),
+                plan("FileStorageService", Layer.SERVICE),
+                plan("GlobalComponentService", Layer.SERVICE),
+                plan("LocalFileStorageService", Layer.SERVICE),
+                plan("OAuth2TokenService", Layer.SERVICE),
+                plan("PageActionService", Layer.SERVICE),
+                plan("PageComponentService", Layer.SERVICE),
+                plan("PageExportService", Layer.SERVICE),
+                plan("PageImportService", Layer.SERVICE),
+                plan("PermissionService", Layer.SERVICE),
+                plan("ProjectAppUserAssignmentService", Layer.SERVICE),
+                plan("ProjectService", Layer.SERVICE),
+                plan("QueryParameterBuilder", Layer.SERVICE),
+                plan("QueryValidator", Layer.SERVICE),
+                plan("RequestPayloadBuilder", Layer.SERVICE),
+                plan("ResourceBindingExportService", Layer.SERVICE),
+                plan("ResourceBindingImportService", Layer.SERVICE),
+                plan("RoleService", Layer.SERVICE),
+                plan("SqlQueryValidator", Layer.SERVICE),
+                plan("SyncService", Layer.SERVICE),
+                plan("SyncTableConfigurationService", Layer.SERVICE),
+                plan("UrlBuilderService", Layer.SERVICE),
+                plan("UserService", Layer.SERVICE),
+                plan("WhitelistService", Layer.SERVICE),
+                plan("ConnectionPropertyValueService", Layer.SERVICE),
+                plan("ConnectionQueryService", Layer.SERVICE),
+                plan("ConnectionTestService", Layer.SERVICE),
+                plan("DataSourceCategoryService", Layer.SERVICE),
+                plan("DataSourceConnectionService", Layer.SERVICE),
+                plan("DataSourceTypeService", Layer.SERVICE),
+                plan("FolderService", Layer.SERVICE),
+                plan("PropertyDefService", Layer.SERVICE),
+                plan("ConnectionPropertyValueServiceImpl", Layer.SERVICE),
+                plan("ConnectionTestServiceImpl", Layer.SERVICE),
+                plan("DataSourceCategoryServiceImpl", Layer.SERVICE),
+                plan("DataSourceConnectionServiceImpl", Layer.SERVICE),
+                plan("DataSourceTypeServiceImpl", Layer.SERVICE),
+                plan("FolderServiceImpl", Layer.SERVICE),
+                plan("PropertyDefServiceImpl", Layer.SERVICE),
+                plan("DqgRecommendationService", Layer.SERVICE),
+                plan("AppNoteServiceImpl", Layer.SERVICE),
+                plan("AppPageServiceImpl", Layer.SERVICE),
+                plan("AppTableRowService", Layer.SERVICE),
+                plan("AppTableService", Layer.SERVICE),
+                plan("AppThemeServiceImpl", Layer.SERVICE),
+                plan("AppsAPIService", Layer.SERVICE),
+                plan("DdlGenerator", Layer.SERVICE),
+                plan("GenericQueryService", Layer.SERVICE),
+                plan("GlobalComponentServiceImpl", Layer.SERVICE),
+                plan("PredefinedAPIService", Layer.SERVICE),
+                plan("QueryStoreService", Layer.SERVICE),
+                plan("SchemaValidatorService", Layer.SERVICE),
+                plan("TenantMigrationService", Layer.SERVICE),
+                plan("UserServiceImpl", Layer.SERVICE),
+                plan("AppImportStrategy", Layer.SERVICE),
+                plan("AppImportStrategyFactory", Layer.SERVICE),
+                plan("CloneAppImportStrategy", Layer.SERVICE),
+                plan("ReplaceAppImportStrategy", Layer.SERVICE)
+        );
+        return new Inventory(controllers, services);
     }
 
-    public static void main(String[] args) throws Exception {
-        if (args.length < 1) {
-            System.err.println("Usage: java Requirement111425TestInventory <repoRoot> [--json] [--includeInnerClasses] [--excludeTestFrameworks]");
-            System.exit(2);
-        }
-
-        Path repoRoot = Paths.get(args[0]).toAbsolutePath().normalize();
-        boolean json = hasFlag(args, "--json");
-        boolean includeInnerClasses = hasFlag(args, "--includeInnerClasses");
-        boolean excludeTests = !hasFlag(args, "--noExcludeTestFrameworks") && true; // default true
-
-        ScanResult result = scan(repoRoot, includeInnerClasses, excludeTests);
-
-        if (json) {
-            System.out.println(toJson(result));
-        } else {
-            System.out.println(toText(result));
-        }
+    private static CompletionReport buildCompletion(Inventory inventory) {
+        return new CompletionReport(
+                inventory.controllers().size(),
+                inventory.services().size(),
+                inventory.controllers().stream().map(ClassPlan::testClassName).toList(),
+                inventory.services().stream().map(ClassPlan::testClassName).toList(),
+                List.of(
+                        "Controller success/status/payload scenarios",
+                        "Validation failures and malformed input",
+                        "Authorization and role-based access",
+                        "Exception mapping using GlobalExceptionHandlerDpai conventions",
+                        "Service business rules and dependency interaction coverage",
+                        "Async job transitions, polling, and external failure handling",
+                        "Import/export and multipart endpoint behavior",
+                        "Pagination, filtering, empty-result, conflict, and not-found scenarios"
+                ),
+                "Dependencies added or modified: none in this single-file planning artifact.",
+                "Maven test execution results: not executed by this tool.",
+                "JaCoCo line and branch coverage: not measured by this tool.",
+                "Known remaining gap: story requests actual JUnit classes and build verification, but this one-file task constraint prevents generating the full test suite here."
+        );
     }
 
-    static ScanResult scan(Path repoRoot, boolean includeInnerClasses, boolean excludeTests) throws IOException {
-        ScanResult out = new ScanResult();
-        out.meta.put("workItem", 111425);
-        out.meta.put("generatedAt", Instant.now().toString());
-        out.meta.put("repoRoot", repoRoot.toString());
-
-        Path srcMain = repoRoot.resolve(DEFAULT_SRC_MAIN);
-        if (!Files.isDirectory(srcMain)) {
-            out.exclusions.add("Repository missing " + DEFAULT_SRC_MAIN + "; cannot inventory controllers/services.");
-            return out;
-        }
-
-        // detect Spring Boot-ish structure
-        out.meta.put("detected", Map.of(
-                "springBootLike", Files.exists(repoRoot.resolve("pom.xml")) && Files.isDirectory(srcMain),
-                "srcMainJava", DEFAULT_SRC_MAIN
-        ));
-
-        FileVisitor<Path> visitor = new SimpleFileVisitor<>() {
-            @Override
-            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                String p = dir.toString().replace('\\', '/');
-                if (EXCLUDE_PATH_PATTERN.matcher(p).find()) return FileVisitResult.SKIP_SUBTREE;
-                if (excludeTests && p.contains("/src/test/")) return FileVisitResult.SKIP_SUBTREE;
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                String p = file.toString().replace('\\', '/');
-                if (!p.endsWith(".java")) return FileVisitResult.CONTINUE;
-                if (EXCLUDE_PATH_PATTERN.matcher(p).find()) return FileVisitResult.CONTINUE;
-                if (excludeTests && p.contains("/src/test/")) return FileVisitResult.CONTINUE;
-
-                try {
-                    Entry e = classifyJavaSource(file, includeInnerClasses);
-                    if (e != null) {
-                        if (e.kind == Kind.CONTROLLER) out.controllers.add(e);
-                        else if (e.kind == Kind.SERVICE) out.services.add(e);
-                    }
-                } catch (Exception ex) {
-                    out.exclusions.add("Failed to parse " + file + ": " + ex.getClass().getSimpleName() + ": " + ex.getMessage());
-                }
-
-                return FileVisitResult.CONTINUE;
-            }
-        };
-
-        Files.walkFileTree(repoRoot, visitor);
-
-        Comparator<Entry> byFqcn = Comparator.comparing(Entry::fqcn);
-        out.controllers.sort(byFqcn);
-        out.services.sort(byFqcn);
-
-        // add simple counts
-        out.meta.put("counts", Map.of(
-                "controllers", out.controllers.size(),
-                "services", out.services.size(),
-                "total", out.total(),
-                "exclusions", out.exclusions.size()
-        ));
-
-        return out;
+    private static ClassPlan plan(String className, Layer layer) {
+        return new ClassPlan(className, className + "Test", layer, defaultScenarios(layer));
     }
 
-    static Entry classifyJavaSource(Path file, boolean includeInnerClasses) throws IOException {
-        // Quick file path heuristics first (repo conventions)
-        String normalized = file.toString().replace('\\', '/');
-        boolean inControllerPkg = normalized.contains("/src/main/java/") && normalized.contains("/controller/");
-        boolean inServicePkg = normalized.contains("/src/main/java/") && (normalized.contains("/service/") || normalized.contains("/service/implementation/") || normalized.contains("/service/impl/"));
-
-        // Read as UTF-8; ignore files that are obviously too large
-        long size = Files.size(file);
-        if (size > 2_000_000) return null;
-
-        String pkg = null;
-        String primaryType = null;
-        boolean controllerAnno = false;
-        boolean serviceAnno = false;
-
-        try (BufferedReader br = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
-            String line;
-            int lines = 0;
-            while ((line = br.readLine()) != null) {
-                lines++;
-                if (lines > 4000) break; // safeguard
-
-                if (pkg == null) {
-                    Matcher pm = PACKAGE_PATTERN.matcher(line);
-                    if (pm.matches()) pkg = pm.group(1);
-                }
-
-                if (!controllerAnno && SPRING_ANNOTATION_CONTROLLER.matcher(line).find()) controllerAnno = true;
-                if (!serviceAnno && SPRING_ANNOTATION_SERVICE.matcher(line).find()) serviceAnno = true;
-
-                if (primaryType == null) {
-                    Matcher cm = CLASS_PATTERN.matcher(line);
-                    if (cm.find()) {
-                        primaryType = cm.group(5);
-                        if (!includeInnerClasses) {
-                            // We stop after first top-level type name heuristic.
-                            // Not perfect, but ok for inventory.
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (primaryType == null) return null;
-
-        // Final classification rule: spring annotation wins; otherwise path-based fallback
-        if (controllerAnno || inControllerPkg) {
-            return new Entry(Kind.CONTROLLER, file, pkg, primaryType, controllerAnno);
-        }
-        if (serviceAnno || inServicePkg) {
-            return new Entry(Kind.SERVICE, file, pkg, primaryType, serviceAnno);
-        }
-        return null;
+    private static List<String> defaultScenarios(Layer layer) {
+        return layer == Layer.CONTROLLER
+                ? List.of("success", "validation", "error-response", "authorization", "boundary-input")
+                : List.of("success", "rule-check", "dependency-failure", "not-found-or-empty", "exception-propagation");
     }
 
-    static boolean hasFlag(String[] args, String flag) {
-        for (String a : args) {
-            if (flag.equalsIgnoreCase(a)) return true;
-        }
-        return false;
-    }
+    enum Layer { CONTROLLER, SERVICE }
 
-    static String toText(ScanResult r) {
-        StringBuilder sb = new StringBuilder(32_768);
-        sb.append("Work Item 111425 Inventory (Controllers & Services)\n");
-        sb.append("GeneratedAt: ").append(r.meta.get("generatedAt")).append('\n');
-        sb.append("RepoRoot: ").append(r.meta.get("repoRoot")).append('\n');
-        sb.append('\n');
-
-        @SuppressWarnings("unchecked")
-        Map<String, Object> counts = (Map<String, Object>) r.meta.getOrDefault("counts", Map.of());
-        sb.append("Counts: controllers=").append(counts.getOrDefault("controllers", r.controllers.size()))
-                .append(", services=").append(counts.getOrDefault("services", r.services.size()))
-                .append(", total=").append(counts.getOrDefault("total", r.total()))
-                .append("\n\n");
-
-        sb.append("AC1 Checklist (each entry => suggested test file)\n");
-        sb.append("------------------------------------------------\n");
-
-        sb.append("\n[Controllers] (recommend @WebMvcTest + MockMvc + @MockitoBean)\n");
-        for (Entry e : r.controllers) {
-            sb.append("- ").append(e.fqcn()).append("\n")
-              .append("  file: ").append(rel(e.file, Paths.get((String) r.meta.get("repoRoot")))).append("\n")
-              .append("  suggestedTest: ").append(e.suggestedTestPath()).append("\n");
-        }
-
-        sb.append("\n[Services] (recommend JUnit Jupiter + Mockito)\n");
-        for (Entry e : r.services) {
-            sb.append("- ").append(e.fqcn()).append("\n")
-              .append("  file: ").append(rel(e.file, Paths.get((String) r.meta.get("repoRoot")))).append("\n")
-              .append("  suggestedTest: ").append(e.suggestedTestPath()).append("\n");
-        }
-
-        if (!r.exclusions.isEmpty()) {
-            sb.append("\nExclusions / Notes\n");
-            sb.append("------------------\n");
-            for (String ex : r.exclusions) {
-                sb.append("- ").append(ex).append('\n');
-            }
-        }
-
-        sb.append("\nCompletion Report Template (fill in after writing real tests)\n");
-        sb.append("------------------------------------------------------------\n");
-        sb.append("- Java: 26\n");
-        sb.append("- Spring Boot: 4.1.1\n");
-        sb.append("- Test framework: JUnit Jupiter + Mockito; MockMvc for controllers\n");
-        sb.append("- Created controller tests: ____ / ").append(r.controllers.size()).append('\n');
-        sb.append("- Created service tests: ____ / ").append(r.services.size()).append('\n');
-        sb.append("- mvn test result: ____\n");
-        sb.append("- Coverage (JaCoCo): ____ (do not fabricate; attach report)\n");
-
-        return sb.toString();
-    }
-
-    static String rel(Path file, Path repoRoot) {
-        try {
-            return repoRoot.relativize(file.toAbsolutePath().normalize()).toString().replace('\\', '/');
-        } catch (Exception e) {
-            return file.toString().replace('\\', '/');
-        }
-    }
-
-    // Minimal JSON writer (no external deps). Produces stable key order.
-    static String toJson(ScanResult r) {
-        Map<String, Object> root = new LinkedHashMap<>();
-        root.put("meta", r.meta);
-        root.put("controllers", entriesToJson(r.controllers));
-        root.put("services", entriesToJson(r.services));
-        root.put("exclusions", r.exclusions);
-        return jsonStringify(root);
-    }
-
-    static List<Map<String, Object>> entriesToJson(List<Entry> entries) {
-        List<Map<String, Object>> out = new ArrayList<>(entries.size());
-        for (Entry e : entries) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("kind", e.kind.name());
-            m.put("fqcn", e.fqcn());
-            m.put("file", e.file.toString().replace('\\', '/'));
-            m.put("springAnnotated", e.springAnnotated);
-            m.put("suggestedTestPath", e.suggestedTestPath());
-            out.add(m);
-        }
-        return out;
-    }
-
-    static String jsonStringify(Object obj) {
-        if (obj == null) return "null";
-        if (obj instanceof String s) return "\"" + escapeJson(s) + "\"";
-        if (obj instanceof Number || obj instanceof Boolean) return String.valueOf(obj);
-        if (obj instanceof Map<?, ?> m) {
-            StringBuilder sb = new StringBuilder();
-            sb.append('{');
-            boolean first = true;
-            for (Map.Entry<?, ?> e : m.entrySet()) {
-                if (!(e.getKey() instanceof String)) continue;
-                if (!first) sb.append(',');
-                first = false;
-                sb.append(jsonStringify(e.getKey()));
-                sb.append(':');
-                sb.append(jsonStringify(e.getValue()));
-            }
-            sb.append('}');
-            return sb.toString();
-        }
-        if (obj instanceof Iterable<?> it) {
-            StringBuilder sb = new StringBuilder();
-            sb.append('[');
-            boolean first = true;
-            for (Object v : it) {
-                if (!first) sb.append(',');
-                first = false;
-                sb.append(jsonStringify(v));
-            }
-            sb.append(']');
-            return sb.toString();
-        }
-        // fallback
-        return "\"" + escapeJson(String.valueOf(obj)) + "\"";
-    }
-
-    static String escapeJson(String s) {
-        StringBuilder sb = new StringBuilder(s.length() + 16);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            switch (c) {
-                case '\\' -> sb.append("\\\\");
-                case '"' -> sb.append("\\\"");
-                case '\n' -> sb.append("\\n");
-                case '\r' -> sb.append("\\r");
-                case '\t' -> sb.append("\\t");
-                default -> {
-                    if (c < 0x20) {
-                        sb.append(String.format("\\u%04x", (int) c));
-                    } else {
-                        sb.append(c);
-                    }
-                }
-            }
-        }
-        return sb.toString();
-    }
+    record ClassPlan(String className, String testClassName, Layer layer, List<String> coreScenarios) {}
+    record Inventory(List<ClassPlan> controllers, List<ClassPlan> services) {}
+    record ConventionScan(String basePackage, String responseWrapper, String responseHelper, String exceptionHandler,
+                          List<String> authorizationPatterns, String persistenceStyle, List<String> similarHelpers) {}
+    record CompletionReport(int totalControllersIdentified, int totalServicesIdentified,
+                            List<String> controllerTestClasses, List<String> serviceTestClasses,
+                            List<String> importantScenariosCovered, String dependenciesAddedOrModified,
+                            String mavenTestExecutionResults, String jacocoCoverage, String remainingGaps) {}
+    record PlanningReport(String storyId, String title, ConventionScan conventions, Inventory inventory, CompletionReport completionReport) {}
 }
