@@ -3,207 +3,126 @@ Story ID: 112324
 Title: Decommission Unused Data Studio Services and APIs – dqg-backend & dqg-ui
 
 What this code does:
-- Provides a standalone Java 17 program that models the decommissioning workflow described in the work item.
-- Accepts a structured command-line request for known dependencies, monitoring artifacts, deployment configs, and documentation status.
-- Validates that dqg-backend and dqg-ui can be decommissioned only when there are no active dependencies or integrations impacted.
-- Produces a post-decommission validation report aligned to the acceptance criteria.
+- Provides a standalone Java 17 program that validates and executes a decommissioning checklist
+  for the unused Data Studio services dqg-backend and dqg-ui.
+- Tracks required decommissioning steps from the work item acceptance criteria and reports whether
+  post-decommission validation passes.
 
 Assumptions:
-- The work item describes an operational process rather than an application feature, so this program implements the closest useful tool: a decommissioning validator/planner.
-- No comments, attachments, linked items, repro steps, or custom fields were returned by the work item reader, so the implementation is based only on the returned fields, description, and acceptance criteria.
-- Repo content was unavailable because the Azure DevOps repository lookup failed, so this is a standalone fallback implementation.
-- Input is provided as key=value arguments with comma-separated lists where applicable.
+- The work item describes an operational decommissioning activity rather than an existing repo feature,
+  so the closest useful buildable artifact is a checklist-driven validator tool.
+- Missing sections from the work item page: comments/discussion, attachments, links/related items,
+  repro steps, system info, and custom fields were not returned by the work item tool.
+- Repo context was unavailable because the Azure DevOps repo read failed, so this is a standalone fallback.
+- Service names are validated exactly as dqg-backend and dqg-ui.
+- Each checklist item is supplied as key=value on the command line using true/false values.
 
-Compile and run:
+Compile:
   javac 112324.java
-  java DataStudioServiceDecommissionTool targets=dqg-backend,dqg-ui activeDependencies=none activeIntegrations=none monitoring=cpu-alert,latency-dashboard deploymentConfigs=helm-dqg-backend,helm-dqg-ui documentationUpdated=true validationChecks=api-gateway,job-scheduler
+Run:
+  java DataStudioDecommissionValidator service:dqg-backend=true service:dqg-ui=true dependenciesCleared=true monitoringRemoved=true documentationUpdated=true postValidationPassed=true
 
 Requires Java 17+
 */
-class DataStudioServiceDecommissionTool {
+class DataStudioDecommissionValidator {
+    private static final String STORY_ID = "112324";
+    private static final String TITLE = "Decommission Unused Data Studio Services and APIs – dqg-backend & dqg-ui";
 
     public static void main(String[] args) {
-        Request request = Request.parse(args);
-
-        if (request.showHelp) {
+        if (args.length == 0) {
             printUsage();
             return;
         }
 
-        Result result = evaluate(request);
+        DecommissionStatus status = DecommissionStatus.fromArgs(args);
+        ValidationResult result = validate(status);
         System.out.println(result.format());
     }
 
-    private static Result evaluate(Request request) {
-        Result result = new Result(request);
+    private static ValidationResult validate(DecommissionStatus status) {
+        StringBuilder details = new StringBuilder();
+        boolean success = true;
 
-        boolean backendRequested = request.targets.contains("dqg-backend");
-        boolean uiRequested = request.targets.contains("dqg-ui");
+        success &= appendCheck(details, "dqg-backend service is successfully decommissioned", status.dqgBackendDecommissioned);
+        success &= appendCheck(details, "dqg-ui service is successfully decommissioned", status.dqgUiDecommissioned);
+        success &= appendCheck(details, "No active dependencies or integrations are impacted", status.dependenciesCleared);
+        success &= appendCheck(details, "Monitoring, alerts, and deployment configurations are removed", status.monitoringRemoved);
+        success &= appendCheck(details, "Documentation is updated to reflect the decommissioning", status.documentationUpdated);
+        success &= appendCheck(details, "Post-decommission validation confirms no impact on other Data Studio components", status.postValidationPassed);
 
-        result.backendDecommissioned = backendRequested && request.activeDependencies.isEmpty() && request.activeIntegrations.isEmpty();
-        result.uiDecommissioned = uiRequested && request.activeDependencies.isEmpty() && request.activeIntegrations.isEmpty();
-        result.noDependenciesImpacted = request.activeDependencies.isEmpty() && request.activeIntegrations.isEmpty();
-        result.monitoringRemoved = !request.monitoringArtifacts.isEmpty();
-        result.deploymentConfigsRemoved = !request.deploymentConfigs.isEmpty();
-        result.documentationUpdated = request.documentationUpdated;
-        result.postValidationPassed = result.backendDecommissioned
-                && result.uiDecommissioned
-                && result.noDependenciesImpacted
-                && result.monitoringRemoved
-                && result.deploymentConfigsRemoved
-                && result.documentationUpdated;
+        return new ValidationResult(success, details.toString().trim());
+    }
 
-        if (!backendRequested || !uiRequested) {
-            result.assumptions.add("Assumption applied: both dqg-backend and dqg-ui should be supplied in targets to fully satisfy the story.");
-        }
-        if (request.validationChecks.isEmpty()) {
-            result.assumptions.add("Assumption applied: no explicit post-decommission checks were supplied, so overall validation is inferred from acceptance-criteria conditions.");
-        }
-        return result;
+    private static boolean appendCheck(StringBuilder details, String label, boolean passed) {
+        details.append(passed ? "[PASS] " : "[FAIL] ")
+               .append(label)
+               .append(System.lineSeparator());
+        return passed;
     }
 
     private static void printUsage() {
+        System.out.println("Story " + STORY_ID + ": " + TITLE);
         System.out.println("Usage:");
         System.out.println("  javac 112324.java");
-        System.out.println("  java DataStudioServiceDecommissionTool \\");
-        System.out.println("    targets=dqg-backend,dqg-ui \\");
-        System.out.println("    activeDependencies=none \\");
-        System.out.println("    activeIntegrations=none \\");
-        System.out.println("    monitoring=cpu-alert,latency-dashboard \\");
-        System.out.println("    deploymentConfigs=helm-dqg-backend,helm-dqg-ui \\");
-        System.out.println("    documentationUpdated=true \\");
-        System.out.println("    validationChecks=api-gateway,job-scheduler");
+        System.out.println("  java DataStudioDecommissionValidator "
+                + "service:dqg-backend=<true|false> "
+                + "service:dqg-ui=<true|false> "
+                + "dependenciesCleared=<true|false> "
+                + "monitoringRemoved=<true|false> "
+                + "documentationUpdated=<true|false> "
+                + "postValidationPassed=<true|false>");
         System.out.println();
-        System.out.println("Accepted keys: targets, activeDependencies, activeIntegrations, monitoring, deploymentConfigs, documentationUpdated, validationChecks");
-        System.out.println("Use 'none' for empty lists.");
+        System.out.println("Example:");
+        System.out.println("  java DataStudioDecommissionValidator "
+                + "service:dqg-backend=true service:dqg-ui=true dependenciesCleared=true "
+                + "monitoringRemoved=true documentationUpdated=true postValidationPassed=true");
     }
 
-    static final class Request {
-        final java.util.Set<String> targets = new java.util.LinkedHashSet<>();
-        final java.util.Set<String> activeDependencies = new java.util.LinkedHashSet<>();
-        final java.util.Set<String> activeIntegrations = new java.util.LinkedHashSet<>();
-        final java.util.Set<String> monitoringArtifacts = new java.util.LinkedHashSet<>();
-        final java.util.Set<String> deploymentConfigs = new java.util.LinkedHashSet<>();
-        final java.util.Set<String> validationChecks = new java.util.LinkedHashSet<>();
-        boolean documentationUpdated;
-        boolean showHelp;
-
-        static Request parse(String[] args) {
-            Request request = new Request();
-            if (args == null || args.length == 0) {
-                request.showHelp = true;
-                return request;
-            }
+    private record DecommissionStatus(
+            boolean dqgBackendDecommissioned,
+            boolean dqgUiDecommissioned,
+            boolean dependenciesCleared,
+            boolean monitoringRemoved,
+            boolean documentationUpdated,
+            boolean postValidationPassed
+    ) {
+        static DecommissionStatus fromArgs(String[] args) {
+            boolean backend = false;
+            boolean ui = false;
+            boolean dependencies = false;
+            boolean monitoring = false;
+            boolean docs = false;
+            boolean validation = false;
 
             for (String arg : args) {
-                if (arg == null || arg.isBlank()) {
+                String[] pair = arg.split("=", 2);
+                if (pair.length != 2) {
                     continue;
                 }
-                if ("--help".equalsIgnoreCase(arg) || "-h".equalsIgnoreCase(arg)) {
-                    request.showHelp = true;
-                    return request;
-                }
-                int idx = arg.indexOf('=');
-                if (idx <= 0 || idx == arg.length() - 1) {
-                    continue;
-                }
-                String key = arg.substring(0, idx).trim();
-                String value = arg.substring(idx + 1).trim();
+                String key = pair[0].trim();
+                boolean value = Boolean.parseBoolean(pair[1].trim());
+
                 switch (key) {
-                    case "targets" -> addValues(request.targets, value);
-                    case "activeDependencies" -> addValues(request.activeDependencies, value);
-                    case "activeIntegrations" -> addValues(request.activeIntegrations, value);
-                    case "monitoring" -> addValues(request.monitoringArtifacts, value);
-                    case "deploymentConfigs" -> addValues(request.deploymentConfigs, value);
-                    case "validationChecks" -> addValues(request.validationChecks, value);
-                    case "documentationUpdated" -> request.documentationUpdated = Boolean.parseBoolean(value);
+                    case "service:dqg-backend" -> backend = value;
+                    case "service:dqg-ui" -> ui = value;
+                    case "dependenciesCleared" -> dependencies = value;
+                    case "monitoringRemoved" -> monitoring = value;
+                    case "documentationUpdated" -> docs = value;
+                    case "postValidationPassed" -> validation = value;
                     default -> {
-                        // Requirement does not ask for strict unknown-key validation.
                     }
                 }
             }
-            return request;
-        }
 
-        private static void addValues(java.util.Set<String> target, String value) {
-            if (value.equalsIgnoreCase("none")) {
-                return;
-            }
-            for (String part : value.split(",")) {
-                String trimmed = part.trim();
-                if (!trimmed.isEmpty()) {
-                    target.add(trimmed);
-                }
-            }
+            return new DecommissionStatus(backend, ui, dependencies, monitoring, docs, validation);
         }
     }
 
-    static final class Result {
-        final Request request;
-        final java.util.List<String> assumptions = new java.util.ArrayList<>();
-        boolean backendDecommissioned;
-        boolean uiDecommissioned;
-        boolean noDependenciesImpacted;
-        boolean monitoringRemoved;
-        boolean deploymentConfigsRemoved;
-        boolean documentationUpdated;
-        boolean postValidationPassed;
-
-        Result(Request request) {
-            this.request = request;
-        }
-
+    private record ValidationResult(boolean success, String details) {
         String format() {
-            StringBuilder sb = new StringBuilder();
-            sb.append("Requirement Summary\n");
-            sb.append("- Story ID: 112324\n");
-            sb.append("- Title: Decommission Unused Data Studio Services and APIs – dqg-backend & dqg-ui\n");
-            sb.append("- State: New\n");
-            sb.append("- Area: AAVA\\AAVA - Data Studio\n");
-            sb.append("- Iteration: AAVA\\PI4\\Sprint 4\n");
-            sb.append("- Missing returned sections: comments/discussion, attachments, links/related items, repro steps, system info, custom fields beyond the standard fields shown.\n");
-            sb.append("- Repo context: unavailable; Azure DevOps repository lookup failed, so standalone mode was used.\n\n");
-
-            sb.append("Decommission Assessment\n");
-            sb.append("- Requested targets: ").append(renderSet(request.targets)).append("\n");
-            sb.append("- Active dependencies: ").append(renderSet(request.activeDependencies)).append("\n");
-            sb.append("- Active integrations: ").append(renderSet(request.activeIntegrations)).append("\n");
-            sb.append("- Monitoring artifacts slated for removal: ").append(renderSet(request.monitoringArtifacts)).append("\n");
-            sb.append("- Deployment configs slated for removal: ").append(renderSet(request.deploymentConfigs)).append("\n");
-            sb.append("- Documentation updated: ").append(documentationUpdated).append("\n");
-            sb.append("- Post-validation checks noted: ").append(renderSet(request.validationChecks)).append("\n\n");
-
-            sb.append("Acceptance Criteria Status\n");
-            sb.append("- dqg-backend service is successfully decommissioned: ").append(status(backendDecommissioned)).append("\n");
-            sb.append("- dqg-ui service is successfully decommissioned: ").append(status(uiDecommissioned)).append("\n");
-            sb.append("- No active dependencies or integrations are impacted: ").append(status(noDependenciesImpacted)).append("\n");
-            sb.append("- Monitoring related to these services is removed: ").append(status(monitoringRemoved)).append("\n");
-            sb.append("- Deployment configurations related to these services are removed: ").append(status(deploymentConfigsRemoved)).append("\n");
-            sb.append("- Documentation is updated: ").append(status(documentationUpdated)).append("\n");
-            sb.append("- Post-decommission validation confirms no impact on other Data Studio components: ").append(status(postValidationPassed)).append("\n\n");
-
-            if (!assumptions.isEmpty()) {
-                sb.append("Assumptions\n");
-                for (String assumption : assumptions) {
-                    sb.append("- ").append(assumption).append("\n");
-                }
-                sb.append('\n');
-            }
-
-            sb.append("Audit Log\n");
-            sb.append("- Evaluated decommission request for services dqg-backend and dqg-ui.\n");
-            sb.append("- Checked for active dependencies and integrations before approving decommission status.\n");
-            sb.append("- Verified presence of monitoring/deployment cleanup inputs and documentation update flag.\n");
-            sb.append("- Calculated final validation outcome against the returned acceptance criteria.\n");
-            return sb.toString();
-        }
-
-        private String renderSet(java.util.Set<String> values) {
-            return values.isEmpty() ? "none" : String.join(", ", values);
-        }
-
-        private String status(boolean value) {
-            return value ? "PASS" : "FAIL";
+            return "Decommission Validation Result: " + (success ? "SUCCESS" : "FAILED")
+                    + System.lineSeparator()
+                    + details;
         }
     }
 }
