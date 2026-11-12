@@ -3,16 +3,15 @@ Story ID: 118124
 Title: UI: Base URL groups UI integration
 Requires Node 18+ / TypeScript 5+
 
-What this file does:
-Implements a standalone TypeScript model/controller-style utility for Base URL group UI integration logic.
-It covers listing groups, inline backend validation mapping for unique/required names, active Base URL switching with confirmation data,
-no-active warnings, deletion blocking when APIs reference a Base URL, masking of sensitive authentication values, unchanged placeholders,
-and screen state shaping for loading/empty/error UI scenarios.
+What this code does:
+Implements a standalone TypeScript model/controller layer for managing Base URL groups in a UI-facing way.
+It supports listing groups, creating unique groups, adding Base URLs with masked sensitive fields, enforcing exactly one active Base URL per group when requested, deactivating the active Base URL, selecting a group for API configuration, and blocking deletion when referenced APIs exist.
 
 Assumptions:
-- Repo content was not provided, so this is a standalone TypeScript implementation.
-- Backend/API calls are represented through typed in-memory data and response-mapping methods so the file remains self-contained and runnable.
-- The most recent available work item content contained fields, description, and acceptance criteria; comments/attachments/linked items were not returned.
+- Repo content was not provided, so this is a standalone implementation.
+- "Inline backend validation message" is represented as returned validation errors from methods.
+- Sensitive authentication/header/query values are never returned in plaintext once stored; read operations expose only masked or unchanged placeholder values.
+- 403/404 and loading/empty/error UI states are represented through typed view-state responses suitable for a UI layer.
 
 Compile:
   tsc 118124.ts
@@ -20,538 +19,569 @@ Run:
   node 118124.js
 */
 
-type Identifier = string;
-type ScreenState = 'loading' | 'ready' | 'empty' | 'error';
-type BadgeStatus = 'Active' | 'Inactive';
-type AuthFieldMode = 'masked' | 'unchanged-placeholder' | 'plain-input';
-
-interface ValidationError {
-  field: string;
-  message: string;
-}
-
-interface ApiErrorPayload {
-  status: number;
-  message: string;
-  details?: string[];
-}
-
-interface HeaderEntry {
-  key: string;
-  value: string;
-}
-
-interface QueryParameterEntry {
-  key: string;
-  value: string;
-}
-
-interface AuthenticationSecret {
-  key: string;
-  maskedValue: string;
-  mode: AuthFieldMode;
-}
-
-interface AuthenticationConfig {
-  type: 'none' | 'basic' | 'bearer' | 'apiKey' | 'oauth2' | 'custom';
-  secrets: AuthenticationSecret[];
-}
-
-interface BaseUrlRecord {
-  id: Identifier;
-  groupId: Identifier;
-  name: string;
-  baseUrl: string;
-  authentication: AuthenticationConfig;
-  headers: HeaderEntry[];
-  queryParameters: QueryParameterEntry[];
-  isActive: boolean;
-}
-
-interface BaseUrlGroupRecord {
-  id: Identifier;
-  ownerUserId: Identifier;
-  name: string;
-}
-
-interface ReferencingApiRecord {
-  apiId: Identifier;
-  apiName: string;
-  baseUrlId: Identifier;
-}
-
-interface UserContext {
-  userId: Identifier;
-}
-
-interface GroupListItemViewModel {
-  id: Identifier;
-  name: string;
-  warning?: string;
-  baseUrls: BaseUrlListItemViewModel[];
-}
-
-interface BaseUrlListItemViewModel {
-  id: Identifier;
-  name: string;
-  baseUrl: string;
-  status: BadgeStatus;
-  authentication: AuthenticationConfig;
-  headers: HeaderEntry[];
-  queryParameters: QueryParameterEntry[];
-}
-
-interface GroupListScreenViewModel {
-  state: ScreenState;
-  groups: GroupListItemViewModel[];
-  errorMessage?: string;
-}
-
-interface ConfirmActivationResult {
-  requiresConfirmation: boolean;
-  message?: string;
-  targetBaseUrlId: Identifier;
-  targetBaseUrlName: string;
-  willDeactivateBaseUrlId?: Identifier;
-  willDeactivateBaseUrlName?: string;
-}
-
-interface OperationResult<T> {
-  success: boolean;
-  data?: T;
-  error?: string;
-  validationErrors?: ValidationError[];
-}
-
-interface CreateGroupInput {
-  name: string;
-}
-
-interface CreateBaseUrlInput {
-  name: string;
-  baseUrl: string;
-  authentication: AuthenticationConfig;
-  headers: HeaderEntry[];
-  queryParameters: QueryParameterEntry[];
-  isActive: boolean;
-}
-
 class BaseUrlGroupsUiIntegration {
-  private readonly unchangedPlaceholder: string = 'unchanged';
-  private readonly groups: BaseUrlGroupRecord[] = [];
-  private readonly baseUrls: BaseUrlRecord[] = [];
-  private readonly apiReferences: ReferencingApiRecord[] = [];
+  private static readonly UNCHANGED_PLACEHOLDER = '•••• unchanged';
+  private static readonly MASK = '••••';
 
-  public constructor() {
-    const userId: Identifier = 'user-1';
-    const otherUserId: Identifier = 'user-2';
+  private readonly groups = new Map<string, BaseUrlGroupsUiIntegration.Group>();
+  private readonly apiConfigurations = new Map<string, BaseUrlGroupsUiIntegration.ApiConfiguration>();
 
-    this.groups.push(
-      { id: 'group-1', ownerUserId: userId, name: 'DEV / QA / PROD' },
-      { id: 'group-2', ownerUserId: userId, name: 'Sandbox' },
-      { id: 'group-3', ownerUserId: otherUserId, name: 'Other User Group' },
-    );
-
-    this.baseUrls.push(
-      {
-        id: 'base-1',
-        groupId: 'group-1',
-        name: 'DEV Endpoint',
-        baseUrl: 'https://dev.example.com',
-        authentication: {
-          type: 'bearer',
-          secrets: [{ key: 'token', maskedValue: '********', mode: 'masked' }],
-        },
-        headers: [{ key: 'x-env', value: 'dev' }],
-        queryParameters: [{ key: 'version', value: '1' }],
-        isActive: true,
-      },
-      {
-        id: 'base-2',
-        groupId: 'group-1',
-        name: 'QA Endpoint',
-        baseUrl: 'https://qa.example.com',
-        authentication: {
-          type: 'apiKey',
-          secrets: [{ key: 'apiKey', maskedValue: '********', mode: 'masked' }],
-        },
-        headers: [{ key: 'x-env', value: 'qa' }],
-        queryParameters: [],
-        isActive: false,
-      },
-      {
-        id: 'base-3',
-        groupId: 'group-2',
-        name: 'Sandbox Endpoint',
-        baseUrl: 'https://sandbox.example.com',
-        authentication: {
-          type: 'none',
-          secrets: [],
-        },
-        headers: [],
-        queryParameters: [],
-        isActive: false,
-      },
-      {
-        id: 'base-4',
-        groupId: 'group-3',
-        name: 'Private Endpoint',
-        baseUrl: 'https://private.example.com',
-        authentication: {
-          type: 'basic',
-          secrets: [
-            { key: 'username', maskedValue: '********', mode: 'masked' },
-            { key: 'password', maskedValue: '********', mode: 'masked' },
-          ],
-        },
-        headers: [],
-        queryParameters: [],
-        isActive: true,
-      },
-    );
-
-    this.apiReferences.push(
-      { apiId: 'api-1', apiName: 'Customer Search API', baseUrlId: 'base-1' },
-      { apiId: 'api-2', apiName: 'Order Sync API', baseUrlId: 'base-1' },
-    );
-  }
-
-  public getGroupsScreen(user: UserContext): GroupListScreenViewModel {
-    const ownedGroups: BaseUrlGroupRecord[] = this.groups.filter((group) => group.ownerUserId === user.userId);
+  public listGroupsForUser(userId: string): BaseUrlGroupsUiIntegration.GroupsScreenState {
+    const ownedGroups = Array.from(this.groups.values())
+      .filter((group) => group.ownerUserId === userId)
+      .map((group) => this.toGroupView(group));
 
     if (ownedGroups.length === 0) {
       return {
-        state: 'empty',
+        status: 'empty',
         groups: [],
+        message: 'No Base URL groups found.'
       };
     }
 
-    const groups: GroupListItemViewModel[] = ownedGroups.map((group) => {
-      const groupBaseUrls: BaseUrlRecord[] = this.baseUrls.filter((item) => item.groupId === group.id);
-      const activeExists: boolean = groupBaseUrls.some((item) => item.isActive);
-
-      return {
-        id: group.id,
-        name: group.name,
-        warning: activeExists ? undefined : 'No active Base URL',
-        baseUrls: groupBaseUrls.map((item) => this.toBaseUrlListItem(item)),
-      };
-    });
-
     return {
-      state: 'ready',
-      groups,
+      status: 'ready',
+      groups: ownedGroups
     };
   }
 
-  public createGroup(user: UserContext, input: CreateGroupInput): OperationResult<GroupListItemViewModel> {
-    const name: string = input.name.trim();
+  public createGroup(input: BaseUrlGroupsUiIntegration.CreateGroupInput): BaseUrlGroupsUiIntegration.ActionResult<BaseUrlGroupsUiIntegration.GroupView> {
+    const normalizedName = input.name.trim();
 
-    if (name.length === 0) {
+    if (normalizedName.length === 0) {
       return {
-        success: false,
-        validationErrors: [{ field: 'name', message: 'Group name is required.' }],
+        ok: false,
+        error: {
+          code: 'VALIDATION',
+          message: 'Group name is required.',
+          field: 'name'
+        }
       };
     }
 
-    const duplicate: BaseUrlGroupRecord | undefined = this.groups.find(
-      (group) => group.ownerUserId === user.userId && group.name.toLowerCase() === name.toLowerCase(),
+    const duplicate = Array.from(this.groups.values()).find(
+      (group) => group.ownerUserId === input.userId && group.name.toLowerCase() === normalizedName.toLowerCase()
     );
 
-    if (duplicate !== undefined) {
+    if (duplicate) {
       return {
-        success: false,
-        validationErrors: [{ field: 'name', message: 'Group name must be unique.' }],
+        ok: false,
+        error: {
+          code: 'VALIDATION',
+          message: 'A Base URL group with this name already exists.',
+          field: 'name'
+        }
       };
     }
 
-    const group: BaseUrlGroupRecord = {
-      id: this.nextId('group'),
-      ownerUserId: user.userId,
-      name,
+    const group: BaseUrlGroupsUiIntegration.Group = {
+      id: this.generateId('group'),
+      ownerUserId: input.userId,
+      name: normalizedName,
+      baseUrls: [],
+      selectedForApis: []
     };
 
-    this.groups.push(group);
+    this.groups.set(group.id, group);
 
     return {
-      success: true,
-      data: {
-        id: group.id,
-        name: group.name,
-        warning: 'No active Base URL',
-        baseUrls: [],
-      },
+      ok: true,
+      data: this.toGroupView(group)
     };
   }
 
-  public addBaseUrl(
-    user: UserContext,
-    groupId: Identifier,
-    input: CreateBaseUrlInput,
-  ): OperationResult<GroupListItemViewModel> {
-    const group: BaseUrlGroupRecord | undefined = this.findOwnedGroup(user, groupId);
+  public addBaseUrl(input: BaseUrlGroupsUiIntegration.AddBaseUrlInput): BaseUrlGroupsUiIntegration.ActionResult<BaseUrlGroupsUiIntegration.GroupView> {
+    const group = this.groups.get(input.groupId);
 
-    if (group === undefined) {
-      return this.forbiddenOrMissingGroup();
+    if (!group) {
+      return this.notFound('Base URL group was not found.');
     }
 
-    const newBaseUrl: BaseUrlRecord = {
-      id: this.nextId('base'),
-      groupId,
-      name: input.name.trim(),
-      baseUrl: input.baseUrl.trim(),
-      authentication: this.maskAuthenticationForStorage(input.authentication),
-      headers: input.headers.map((header) => ({ ...header })),
-      queryParameters: input.queryParameters.map((parameter) => ({ ...parameter })),
-      isActive: false,
+    if (group.ownerUserId !== input.userId) {
+      return this.forbidden('You can only modify your own Base URL groups.');
+    }
+
+    const baseUrlValue = input.baseUrl.trim();
+    if (baseUrlValue.length === 0) {
+      return {
+        ok: false,
+        error: {
+          code: 'VALIDATION',
+          message: 'Base URL is required.',
+          field: 'baseUrl'
+        }
+      };
+    }
+
+    const newBaseUrl: BaseUrlGroupsUiIntegration.BaseUrlRecord = {
+      id: this.generateId('baseurl'),
+      baseUrl: baseUrlValue,
+      authentication: this.storeSecretEntries(input.authentication ?? []),
+      headers: this.storeSecretEntries(input.headers ?? []),
+      queryParameters: this.storeSecretEntries(input.queryParameters ?? []),
+      isActive: false
     };
 
-    if (input.isActive) {
-      this.deactivateAllInGroup(groupId);
+    if (input.activate === true) {
+      group.baseUrls.forEach((item) => {
+        item.isActive = false;
+      });
       newBaseUrl.isActive = true;
     }
 
-    this.baseUrls.push(newBaseUrl);
+    group.baseUrls.push(newBaseUrl);
 
     return {
-      success: true,
-      data: this.getSingleGroupViewModel(groupId),
+      ok: true,
+      data: this.toGroupView(group)
     };
   }
 
-  public prepareActivation(user: UserContext, baseUrlId: Identifier): OperationResult<ConfirmActivationResult> {
-    const baseUrl: BaseUrlRecord | undefined = this.findOwnedBaseUrl(user, baseUrlId);
-
-    if (baseUrl === undefined) {
-      return this.forbiddenOrMissingBaseUrl();
+  public getActivationImpact(input: BaseUrlGroupsUiIntegration.UserScopedBaseUrlInput): BaseUrlGroupsUiIntegration.ActionResult<BaseUrlGroupsUiIntegration.ActivationImpact> {
+    const groupResult = this.getOwnedGroupWithBaseUrl(input.userId, input.groupId, input.baseUrlId);
+    if (!groupResult.ok) {
+      return groupResult;
     }
 
-    const currentActive: BaseUrlRecord | undefined = this.baseUrls.find(
-      (item) => item.groupId === baseUrl.groupId && item.isActive && item.id !== baseUrl.id,
-    );
-
-    if (currentActive === undefined) {
-      return {
-        success: true,
-        data: {
-          requiresConfirmation: false,
-          targetBaseUrlId: baseUrl.id,
-          targetBaseUrlName: baseUrl.name,
-        },
-      };
-    }
+    const { group, baseUrl } = groupResult.data;
+    const currentlyActive = group.baseUrls.find((item) => item.isActive && item.id !== baseUrl.id);
 
     return {
-      success: true,
+      ok: true,
       data: {
-        requiresConfirmation: true,
-        message: `${currentActive.name} will become inactive.`,
+        groupId: group.id,
         targetBaseUrlId: baseUrl.id,
-        targetBaseUrlName: baseUrl.name,
-        willDeactivateBaseUrlId: currentActive.id,
-        willDeactivateBaseUrlName: currentActive.name,
-      },
+        targetBaseUrl: baseUrl.baseUrl,
+        willDeactivateBaseUrlId: currentlyActive?.id ?? null,
+        willDeactivateBaseUrl: currentlyActive?.baseUrl ?? null,
+        confirmationMessage: currentlyActive
+          ? `Activating ${baseUrl.baseUrl} will deactivate ${currentlyActive.baseUrl}.`
+          : `Activating ${baseUrl.baseUrl} will make it the only active Base URL in this group.`
+      }
     };
   }
 
-  public activateBaseUrl(user: UserContext, baseUrlId: Identifier): OperationResult<GroupListItemViewModel> {
-    const baseUrl: BaseUrlRecord | undefined = this.findOwnedBaseUrl(user, baseUrlId);
-
-    if (baseUrl === undefined) {
-      return this.forbiddenOrMissingBaseUrl();
+  public activateBaseUrl(input: BaseUrlGroupsUiIntegration.UserScopedBaseUrlInput): BaseUrlGroupsUiIntegration.ActionResult<BaseUrlGroupsUiIntegration.GroupView> {
+    const groupResult = this.getOwnedGroupWithBaseUrl(input.userId, input.groupId, input.baseUrlId);
+    if (!groupResult.ok) {
+      return groupResult;
     }
 
-    this.deactivateAllInGroup(baseUrl.groupId);
-    baseUrl.isActive = true;
+    const { group, baseUrl } = groupResult.data;
+    group.baseUrls.forEach((item) => {
+      item.isActive = item.id === baseUrl.id;
+    });
 
     return {
-      success: true,
-      data: this.getSingleGroupViewModel(baseUrl.groupId),
+      ok: true,
+      data: this.toGroupView(group)
     };
   }
 
-  public deactivateBaseUrl(user: UserContext, baseUrlId: Identifier): OperationResult<GroupListItemViewModel> {
-    const baseUrl: BaseUrlRecord | undefined = this.findOwnedBaseUrl(user, baseUrlId);
-
-    if (baseUrl === undefined) {
-      return this.forbiddenOrMissingBaseUrl();
+  public deactivateBaseUrl(input: BaseUrlGroupsUiIntegration.UserScopedBaseUrlInput): BaseUrlGroupsUiIntegration.ActionResult<BaseUrlGroupsUiIntegration.GroupView> {
+    const groupResult = this.getOwnedGroupWithBaseUrl(input.userId, input.groupId, input.baseUrlId);
+    if (!groupResult.ok) {
+      return groupResult;
     }
 
+    const { group, baseUrl } = groupResult.data;
     baseUrl.isActive = false;
 
     return {
-      success: true,
-      data: this.getSingleGroupViewModel(baseUrl.groupId),
+      ok: true,
+      data: this.toGroupView(group)
     };
   }
 
-  public deleteBaseUrl(user: UserContext, baseUrlId: Identifier): OperationResult<GroupListItemViewModel> {
-    const baseUrl: BaseUrlRecord | undefined = this.findOwnedBaseUrl(user, baseUrlId);
-
-    if (baseUrl === undefined) {
-      return this.forbiddenOrMissingBaseUrl();
+  public deleteBaseUrl(input: BaseUrlGroupsUiIntegration.UserScopedBaseUrlInput): BaseUrlGroupsUiIntegration.ActionResult<BaseUrlGroupsUiIntegration.GroupView> {
+    const groupResult = this.getOwnedGroupWithBaseUrl(input.userId, input.groupId, input.baseUrlId);
+    if (!groupResult.ok) {
+      return groupResult;
     }
 
-    const references: ReferencingApiRecord[] = this.apiReferences.filter((reference) => reference.baseUrlId === baseUrlId);
-    if (references.length > 0) {
+    const { group, baseUrl } = groupResult.data;
+    const referencingApis = Array.from(this.apiConfigurations.values())
+      .filter((api) => api.ownerUserId === input.userId && api.groupId === group.id && api.baseUrlId === baseUrl.id)
+      .map((api) => api.apiName);
+
+    if (referencingApis.length > 0) {
       return {
-        success: false,
-        error: `Deleting this Base URL is blocked because it is referenced by: ${references
-          .map((reference) => reference.apiName)
-          .join(', ')}`,
+        ok: false,
+        error: {
+          code: 'CONFLICT',
+          message: `Cannot delete Base URL. Referenced by APIs: ${referencingApis.join(', ')}.`
+        }
       };
     }
 
-    const index: number = this.baseUrls.findIndex((item) => item.id === baseUrlId);
-    if (index >= 0) {
-      this.baseUrls.splice(index, 1);
-    }
+    group.baseUrls = group.baseUrls.filter((item) => item.id !== baseUrl.id);
 
     return {
-      success: true,
-      data: this.getSingleGroupViewModel(baseUrl.groupId),
+      ok: true,
+      data: this.toGroupView(group)
     };
   }
 
-  public getApiConfigurationGroupOptions(user: UserContext): OperationResult<Array<{ id: Identifier; name: string }>> {
-    const options: Array<{ id: Identifier; name: string }> = this.groups
-      .filter((group) => group.ownerUserId === user.userId)
-      .map((group) => ({ id: group.id, name: group.name }));
+  public selectGroupForApi(input: BaseUrlGroupsUiIntegration.SelectGroupForApiInput): BaseUrlGroupsUiIntegration.ActionResult<BaseUrlGroupsUiIntegration.ApiConfigurationView> {
+    const group = this.groups.get(input.groupId);
 
-    return {
-      success: true,
-      data: options,
+    if (!group) {
+      return this.notFound('Base URL group was not found.');
+    }
+
+    if (group.ownerUserId !== input.userId) {
+      return this.forbidden('You can only select your own Base URL groups.');
+    }
+
+    const activeBaseUrl = group.baseUrls.find((item) => item.isActive) ?? null;
+    const apiConfiguration: BaseUrlGroupsUiIntegration.ApiConfiguration = {
+      id: this.generateId('api'),
+      ownerUserId: input.userId,
+      apiName: input.apiName.trim(),
+      groupId: group.id,
+      baseUrlId: activeBaseUrl?.id ?? null
     };
-  }
 
-  public shapeApiErrorForUi(error: ApiErrorPayload): string {
-    if (error.status === 403) {
-      return 'You do not have access to this Base URL group or Base URL.';
-    }
-
-    if (error.status === 404) {
-      return 'The requested Base URL group or Base URL was not found.';
-    }
-
-    if (error.details !== undefined && error.details.length > 0) {
-      return `${error.message}: ${error.details.join('; ')}`;
-    }
-
-    return error.message;
-  }
-
-  public getLoadingState(): GroupListScreenViewModel {
-    return {
-      state: 'loading',
-      groups: [],
-    };
-  }
-
-  public getErrorState(message: string): GroupListScreenViewModel {
-    return {
-      state: 'error',
-      groups: [],
-      errorMessage: message,
-    };
-  }
-
-  public getEditAuthenticationView(user: UserContext, baseUrlId: Identifier): OperationResult<AuthenticationConfig> {
-    const baseUrl: BaseUrlRecord | undefined = this.findOwnedBaseUrl(user, baseUrlId);
-
-    if (baseUrl === undefined) {
-      return this.forbiddenOrMissingBaseUrl();
-    }
+    this.apiConfigurations.set(apiConfiguration.id, apiConfiguration);
+    group.selectedForApis.push(apiConfiguration.id);
 
     return {
-      success: true,
+      ok: true,
       data: {
-        type: baseUrl.authentication.type,
-        secrets: baseUrl.authentication.secrets.map((secret) => ({
-          key: secret.key,
-          maskedValue: this.unchangedPlaceholder,
-          mode: 'unchanged-placeholder',
-        })),
-      },
+        id: apiConfiguration.id,
+        apiName: apiConfiguration.apiName,
+        groupId: group.id,
+        groupName: group.name,
+        activeBaseUrl: activeBaseUrl?.baseUrl ?? null,
+        warning: activeBaseUrl === null ? 'No active Base URL' : null
+      }
     };
   }
 
-  private getSingleGroupViewModel(groupId: Identifier): GroupListItemViewModel {
-    const group: BaseUrlGroupRecord = this.groups.find((item) => item.id === groupId) as BaseUrlGroupRecord;
-    const groupBaseUrls: BaseUrlRecord[] = this.baseUrls.filter((item) => item.groupId === groupId);
-    const activeExists: boolean = groupBaseUrls.some((item) => item.isActive);
+  public editBaseUrl(input: BaseUrlGroupsUiIntegration.EditBaseUrlInput): BaseUrlGroupsUiIntegration.ActionResult<BaseUrlGroupsUiIntegration.GroupView> {
+    const groupResult = this.getOwnedGroupWithBaseUrl(input.userId, input.groupId, input.baseUrlId);
+    if (!groupResult.ok) {
+      return groupResult;
+    }
+
+    const { group, baseUrl } = groupResult.data;
+
+    if (typeof input.baseUrl === 'string') {
+      const trimmed = input.baseUrl.trim();
+      if (trimmed.length === 0) {
+        return {
+          ok: false,
+          error: {
+            code: 'VALIDATION',
+            message: 'Base URL is required.',
+            field: 'baseUrl'
+          }
+        };
+      }
+      baseUrl.baseUrl = trimmed;
+    }
+
+    if (input.authentication) {
+      baseUrl.authentication = this.applySecretEntryUpdates(baseUrl.authentication, input.authentication);
+    }
+
+    if (input.headers) {
+      baseUrl.headers = this.applySecretEntryUpdates(baseUrl.headers, input.headers);
+    }
+
+    if (input.queryParameters) {
+      baseUrl.queryParameters = this.applySecretEntryUpdates(baseUrl.queryParameters, input.queryParameters);
+    }
+
+    return {
+      ok: true,
+      data: this.toGroupView(group)
+    };
+  }
+
+  public getGroupScreen(input: BaseUrlGroupsUiIntegration.UserScopedGroupInput): BaseUrlGroupsUiIntegration.GroupScreenState {
+    const group = this.groups.get(input.groupId);
+
+    if (!group) {
+      return {
+        status: 'error',
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Base URL group was not found.'
+        }
+      };
+    }
+
+    if (group.ownerUserId !== input.userId) {
+      return {
+        status: 'error',
+        error: {
+          code: 'FORBIDDEN',
+          message: 'You can only view your own Base URL groups.'
+        }
+      };
+    }
+
+    return {
+      status: 'ready',
+      group: this.toGroupView(group)
+    };
+  }
+
+  private getOwnedGroupWithBaseUrl(
+    userId: string,
+    groupId: string,
+    baseUrlId: string
+  ): BaseUrlGroupsUiIntegration.ActionResult<{ group: BaseUrlGroupsUiIntegration.Group; baseUrl: BaseUrlGroupsUiIntegration.BaseUrlRecord }> {
+    const group = this.groups.get(groupId);
+
+    if (!group) {
+      return this.notFound('Base URL group was not found.');
+    }
+
+    if (group.ownerUserId !== userId) {
+      return this.forbidden('You can only modify your own Base URL groups.');
+    }
+
+    const baseUrl = group.baseUrls.find((item) => item.id === baseUrlId);
+    if (!baseUrl) {
+      return this.notFound('Base URL was not found.');
+    }
+
+    return {
+      ok: true,
+      data: { group, baseUrl }
+    };
+  }
+
+  private toGroupView(group: BaseUrlGroupsUiIntegration.Group): BaseUrlGroupsUiIntegration.GroupView {
+    const activeCount = group.baseUrls.filter((item) => item.isActive).length;
 
     return {
       id: group.id,
       name: group.name,
-      warning: activeExists ? undefined : 'No active Base URL',
-      baseUrls: groupBaseUrls.map((item) => this.toBaseUrlListItem(item)),
+      warning: activeCount === 0 ? 'No active Base URL' : null,
+      baseUrls: group.baseUrls.map((item) => ({
+        id: item.id,
+        baseUrl: item.baseUrl,
+        status: item.isActive ? 'Active' : 'Inactive',
+        isActive: item.isActive,
+        authentication: this.maskSecretEntries(item.authentication),
+        headers: this.maskSecretEntries(item.headers),
+        queryParameters: this.maskSecretEntries(item.queryParameters)
+      }))
     };
   }
 
-  private toBaseUrlListItem(item: BaseUrlRecord): BaseUrlListItemViewModel {
+  private storeSecretEntries(entries: ReadonlyArray<BaseUrlGroupsUiIntegration.SecretEntryInput>): BaseUrlGroupsUiIntegration.SecretEntry[] {
+    return entries.map((entry) => ({
+      key: entry.key.trim(),
+      value: entry.value,
+      secret: entry.secret
+    }));
+  }
+
+  private applySecretEntryUpdates(
+    existing: ReadonlyArray<BaseUrlGroupsUiIntegration.SecretEntry>,
+    updates: ReadonlyArray<BaseUrlGroupsUiIntegration.SecretEntryUpdateInput>
+  ): BaseUrlGroupsUiIntegration.SecretEntry[] {
+    return updates.map((entry) => {
+      const previous = existing.find((item) => item.key === entry.key.trim());
+      const unchanged = entry.value === BaseUrlGroupsUiIntegration.UNCHANGED_PLACEHOLDER;
+
+      return {
+        key: entry.key.trim(),
+        value: unchanged && previous ? previous.value : entry.value,
+        secret: entry.secret
+      };
+    });
+  }
+
+  private maskSecretEntries(entries: ReadonlyArray<BaseUrlGroupsUiIntegration.SecretEntry>): BaseUrlGroupsUiIntegration.MaskedSecretEntry[] {
+    return entries.map((entry) => ({
+      key: entry.key,
+      value: entry.secret ? BaseUrlGroupsUiIntegration.MASK : entry.value,
+      displayValue: entry.secret ? BaseUrlGroupsUiIntegration.UNCHANGED_PLACEHOLDER : entry.value,
+      secret: entry.secret
+    }));
+  }
+
+  private generateId(prefix: string): string {
+    const random = Math.random().toString(36).slice(2, 10);
+    return `${prefix}_${random}`;
+  }
+
+  private notFound<T>(message: string): BaseUrlGroupsUiIntegration.ActionResult<T> {
     return {
-      id: item.id,
-      name: item.name,
-      baseUrl: item.baseUrl,
-      status: item.isActive ? 'Active' : 'Inactive',
-      authentication: {
-        type: item.authentication.type,
-        secrets: item.authentication.secrets.map((secret) => ({ ...secret, maskedValue: '********', mode: 'masked' })),
-      },
-      headers: item.headers.map((header) => ({ ...header })),
-      queryParameters: item.queryParameters.map((parameter) => ({ ...parameter })),
-    };
-  }
-
-  private maskAuthenticationForStorage(authentication: AuthenticationConfig): AuthenticationConfig {
-    return {
-      type: authentication.type,
-      secrets: authentication.secrets.map((secret) => ({
-        key: secret.key,
-        maskedValue: secret.maskedValue.length === 0 ? '********' : '********',
-        mode: 'masked',
-      })),
-    };
-  }
-
-  private deactivateAllInGroup(groupId: Identifier): void {
-    for (const item of this.baseUrls) {
-      if (item.groupId === groupId) {
-        item.isActive = false;
+      ok: false,
+      error: {
+        code: 'NOT_FOUND',
+        message
       }
-    }
-  }
-
-  private findOwnedGroup(user: UserContext, groupId: Identifier): BaseUrlGroupRecord | undefined {
-    return this.groups.find((group) => group.id === groupId && group.ownerUserId === user.userId);
-  }
-
-  private findOwnedBaseUrl(user: UserContext, baseUrlId: Identifier): BaseUrlRecord | undefined {
-    const candidate: BaseUrlRecord | undefined = this.baseUrls.find((item) => item.id === baseUrlId);
-    if (candidate === undefined) {
-      return undefined;
-    }
-
-    const group: BaseUrlGroupRecord | undefined = this.findOwnedGroup(user, candidate.groupId);
-    return group === undefined ? undefined : candidate;
-  }
-
-  private forbiddenOrMissingGroup(): OperationResult<never> {
-    return {
-      success: false,
-      error: this.shapeApiErrorForUi({ status: 404, message: 'Group not found' }),
     };
   }
 
-  private forbiddenOrMissingBaseUrl(): OperationResult<never> {
+  private forbidden<T>(message: string): BaseUrlGroupsUiIntegration.ActionResult<T> {
     return {
-      success: false,
-      error: this.shapeApiErrorForUi({ status: 404, message: 'Base URL not found' }),
+      ok: false,
+      error: {
+        code: 'FORBIDDEN',
+        message
+      }
     };
   }
+}
 
-  private nextId(prefix: string): Identifier {
-    const randomPart: string = Math.random().toString(36).slice(2, 10);
-    return `${prefix}-${randomPart}`;
+namespace BaseUrlGroupsUiIntegration {
+  export interface Group {
+    id: string;
+    ownerUserId: string;
+    name: string;
+    baseUrls: BaseUrlRecord[];
+    selectedForApis: string[];
   }
+
+  export interface BaseUrlRecord {
+    id: string;
+    baseUrl: string;
+    authentication: SecretEntry[];
+    headers: SecretEntry[];
+    queryParameters: SecretEntry[];
+    isActive: boolean;
+  }
+
+  export interface SecretEntry {
+    key: string;
+    value: string;
+    secret: boolean;
+  }
+
+  export interface MaskedSecretEntry {
+    key: string;
+    value: string;
+    displayValue: string;
+    secret: boolean;
+  }
+
+  export interface ApiConfiguration {
+    id: string;
+    ownerUserId: string;
+    apiName: string;
+    groupId: string;
+    baseUrlId: string | null;
+  }
+
+  export interface CreateGroupInput {
+    userId: string;
+    name: string;
+  }
+
+  export interface SecretEntryInput {
+    key: string;
+    value: string;
+    secret: boolean;
+  }
+
+  export interface SecretEntryUpdateInput {
+    key: string;
+    value: string;
+    secret: boolean;
+  }
+
+  export interface AddBaseUrlInput {
+    userId: string;
+    groupId: string;
+    baseUrl: string;
+    authentication?: SecretEntryInput[];
+    headers?: SecretEntryInput[];
+    queryParameters?: SecretEntryInput[];
+    activate?: boolean;
+  }
+
+  export interface EditBaseUrlInput {
+    userId: string;
+    groupId: string;
+    baseUrlId: string;
+    baseUrl?: string;
+    authentication?: SecretEntryUpdateInput[];
+    headers?: SecretEntryUpdateInput[];
+    queryParameters?: SecretEntryUpdateInput[];
+  }
+
+  export interface UserScopedGroupInput {
+    userId: string;
+    groupId: string;
+  }
+
+  export interface UserScopedBaseUrlInput extends UserScopedGroupInput {
+    baseUrlId: string;
+  }
+
+  export interface SelectGroupForApi {
+    userId: string;
+    apiName: string;
+    groupId: string;
+  }
+
+  export type SelectGroupForApiInput = SelectGroupForApi;
+
+  export interface GroupView {
+    id: string;
+    name: string;
+    warning: string | null;
+    baseUrls: BaseUrlView[];
+  }
+
+  export interface BaseUrlView {
+    id: string;
+    baseUrl: string;
+    status: 'Active' | 'Inactive';
+    isActive: boolean;
+    authentication: MaskedSecretEntry[];
+    headers: MaskedSecretEntry[];
+    queryParameters: MaskedSecretEntry[];
+  }
+
+  export interface ApiConfigurationView {
+    id: string;
+    apiName: string;
+    groupId: string;
+    groupName: string;
+    activeBaseUrl: string | null;
+    warning: string | null;
+  }
+
+  export interface ActivationImpact {
+    groupId: string;
+    targetBaseUrlId: string;
+    targetBaseUrl: string;
+    willDeactivateBaseUrlId: string | null;
+    willDeactivateBaseUrl: string | null;
+    confirmationMessage: string;
+  }
+
+  export type ErrorCode = 'VALIDATION' | 'FORBIDDEN' | 'NOT_FOUND' | 'CONFLICT';
+
+  export interface ActionError {
+    code: ErrorCode;
+    message: string;
+    field?: string;
+  }
+
+  export type ActionResult<T> =
+    | { ok: true; data: T }
+    | { ok: false; error: ActionError };
+
+  export type ViewStatus = 'loading' | 'ready' | 'empty' | 'error';
+
+  export interface GroupsScreenState {
+    status: Exclude<ViewStatus, 'loading'>;
+    groups: GroupView[];
+    message?: string;
+    error?: ActionError;
+  }
+
+  export type GroupScreenState =
+    | { status: 'ready'; group: GroupView }
+    | { status: 'error'; error: ActionError };
 }
