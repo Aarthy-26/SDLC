@@ -1,0 +1,138 @@
+User Story ID: 120640
+Detected Language: Java (Spring Boot) - detected from Java package/import syntax, Spring Framework annotations (@Configuration, @Bean, @Primary), and OpenAPI/Spring Boot server customization APIs.
+Review Summary: Overall code quality is good and aligns with Java/Spring Boot conventions. The implementation addresses most application-side routing requirements for serving the backend under /ava/dpai, preserving controller mappings via servlet context-path configuration, honoring forwarded headers, and exposing OpenAPI server URLs for local and domain access. However, several user story requirements depend on Kubernetes/Helm manifests and runtime deployment validation that are not implemented in this code file, and there are compliance/security concerns around hardcoded infrastructure defaults and embedding deployment guidance inside production code. User story coverage: 7 of 10 requirements fully met, 3 partially met.
+
+User Story Review:
+Requirements Met:
+- AC1: The backend application must support the context path /ava/dpai.
+  Implemented in: AavaDomainRoutingConfiguration.aavaContextPathCustomizer(), normalizeContextPath()
+  Evidence: Resolves and applies /ava/dpai as the servlet context path via ConfigurableServletWebServerFactory.setContextPath().
+- AC2: Existing controller mappings must remain backward compatible with the configured context path.
+  Implemented in: AavaDomainRoutingConfiguration.aavaContextPathCustomizer()
+  Evidence: Uses servlet context path rather than changing controller mappings, preserving existing endpoint mappings beneath the prefix.
+- AC3: APIs must be accessible through the AAVA domain using https://<domain>/ava/dpai/api/...
+  Implemented in: AavaDomainRoutingConfiguration.aavaDomainAwareOpenApi(), buildDomainServerUrl()
+  Evidence: Builds domain-aware OpenAPI server URL combining public domain and normalized context path.
+- AC5: Kubernetes Service must correctly forward traffic to the application container on port 8080.
+  Implemented in: AavaDomainRoutingConfiguration.aavaContextPathCustomizer(), HelmIngressValues.YAML_SNIPPET
+  Evidence: Application is bound to port 8080 and embedded deployment guidance references service targetPort 8080.
+- AC7: Swagger and API documentation endpoints must work through the configured domain prefix.
+  Implemented in: AavaDomainRoutingConfiguration.aavaDomainAwareOpenApi(), forwardedHeaderFilter()
+  Evidence: OpenAPI server URLs include the context path and forwarded headers are honored for reverse-proxy deployments.
+- AC8: Existing direct backend access must continue working where applicable.
+  Implemented in: AavaDomainRoutingConfiguration.aavaContextPathCustomizer(), aavaDomainAwareOpenApi(), buildLocalServerUrl()
+  Evidence: Context path is configurable/optional and local/direct backend server URL is preserved in OpenAPI output.
+- AC10: Configuration must be compatible with the existing Helm deployment setup.
+  Implemented in: HelmIngressValues.YAML_SNIPPET
+  Evidence: Includes suggested Helm values that align with the context path, ingress path, and environment variables.
+
+Requirements Missing or Partial:
+- AC4: Kubernetes Ingress must correctly route requests to the DataPowerAI backend service.
+  Status: Partially Met
+  What is lacking: This file only contains a string snippet with suggested Helm ingress values. It does not modify or validate actual Kubernetes Ingress manifests, nor can it guarantee runtime routing.
+- AC6: Login API must be accessible through the domain and return the expected authentication response.
+  Status: Partially Met
+  What is lacking: No login controller, routing integration test, or endpoint-specific verification is present in the reviewed code. The checklist mentions the login API, but there is no executable validation.
+- AC9: Deployment must be validated for successful routing without 404 or 502 errors.
+  Status: Partially Met
+  What is lacking: No automated integration tests, health checks, smoke tests, or deployment validation logic are implemented. The code includes only a static checklist.
+
+How to Achieve:
+- AC4: Move the ingress configuration from a static string into actual Helm chart values/templates and validate the path rewrite behavior in deployment artifacts.
+  Class/Module to add or change: helm/values.yaml, helm/templates/ingress.yaml (outside this Java class)
+  Code hint (same language style not applicable to Helm, but application-side Java validation could be added):
+  Java hint:
+  @Bean
+  ApplicationRunner logRoutingConfig(Environment env) {
+      return args -> log.info("Routing config: contextPath={}, publicDomain={}",
+          env.getProperty("server.servlet.context-path"),
+          env.getProperty("app.routing.public-domain"));
+  }
+  Also add deployment pipeline checks that apply and verify the ingress manifest.
+- AC6: Add a Spring Boot integration test that calls the login endpoint through the configured context path and validates the authentication response.
+  Class/Module to add or change: src/test/java/.../LoginRoutingIntegrationTest
+  Code hint:
+  @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+      properties = "server.servlet.context-path=/ava/dpai")
+  class LoginRoutingIntegrationTest {
+      @Autowired TestRestTemplate restTemplate;
+
+      @Test
+      void loginEndpoint_isAccessibleUnderConfiguredPrefix() {
+          ResponseEntity<String> response = restTemplate.postForEntity(
+              "/ava/dpai/auth/gettoken", requestBody, String.class);
+          assertThat(response.getStatusCode().is2xxSuccessful()).isTrue();
+      }
+  }
+- AC9: Add deployment validation/smoke tests and readiness checks to verify no 404/502 occurs after deployment.
+  Class/Module to add or change: src/test/java/.../RoutingSmokeTest plus CI/CD deployment validation step
+  Code hint:
+  @Test
+  void swaggerAndApiDocs_areAvailableUnderDomainPrefix() {
+      ResponseEntity<String> response = restTemplate.getForEntity("/ava/dpai/v3/api-docs", String.class);
+      assertThat(response.getStatusCode().value()).isEqualTo(200);
+  }
+  In CI/CD, run curl-based smoke tests against the deployed ingress endpoint and fail the release on 404/502.
+
+Scope Creep:
+- HelmIngressValues.YAML_SNIPPET embeds deployment documentation inside production Java configuration. This is not required runtime functionality and would be better placed in Helm values/templates or operational documentation.
+- RoutingValidationChecklist.CHECKS is documentation-oriented and not executable logic. It adds non-runtime guidance into application code.
+
+Findings:
+Issue: Production code embeds deployment/configuration documentation as static nested classes (HelmIngressValues, RoutingValidationChecklist), mixing operational guidance with runtime configuration.
+Severity: Low
+Recommendation: Move Helm snippets and deployment checklists to Helm chart files, README, ADRs, or ops documentation. Keep the Java configuration class limited to executable application configuration.
+Compliance Impact: Minimal direct regulatory impact, but weakens maintainability and change traceability for SOC2-style configuration management.
+
+Issue: aavaContextPathCustomizer() hardcodes application port 8080 via factory.setPort(8080), potentially overriding environment-driven deployment configuration.
+Severity: Medium
+Recommendation: Remove factory.setPort(8080) and rely on server.port/application properties or injected configuration. In Spring Boot, infrastructure-level port assignment should remain environment/config driven.
+Compliance Impact: Can conflict with enterprise deployment standards and configuration-as-code practices; may impair operational control expected in SOC2 environments.
+
+Issue: Missing automated tests for routing, login accessibility, Swagger accessibility, and backward compatibility under the configured context path.
+Severity: Medium
+Recommendation: Add Spring Boot integration tests using @SpringBootTest or MockMvc/TestRestTemplate to validate /ava/dpai-prefixed routing, login endpoint access, and /v3/api-docs availability.
+Compliance Impact: Weakens release assurance and auditability; impacts SOC2 evidence for change validation.
+
+Issue: No validation of app.routing.public-domain input before constructing OpenAPI server URLs.
+Severity: Medium
+Recommendation: Validate the configured domain using URI parsing or a constrained configuration properties class with Bean Validation annotations. Reject malformed values at startup.
+Compliance Impact: Low direct regulatory impact, but malformed configuration can lead to incorrect documentation or unsafe URL publication.
+
+Issue: buildLocalServerUrl() uses string concatenation for URL construction rather than a URI builder, making the code more error-prone if host/port/path inputs evolve.
+Severity: Low
+Recommendation: Use URI/URIBuilder-style construction where practical, or validate the inputs before concatenation. Current risk is limited because the inputs are controlled configuration values.
+Compliance Impact: None significant.
+
+Issue: The class is package-private and has no API-level documentation/comments for bean methods, reducing maintainability for exported configuration behavior.
+Severity: Low
+Recommendation: Add concise Javadoc explaining the purpose of each bean and the property precedence rules for context-path/public-domain handling.
+Compliance Impact: Improves audit/readability but no direct regulatory violation.
+
+Issue: Requirement coverage for ingress routing and deployment validation is only documentary, not executable.
+Severity: High
+Recommendation: Implement actual Helm/Ingress changes in deployment artifacts and add automated smoke/integration checks in CI/CD to verify 200 responses and absence of 404/502 after deployment.
+Compliance Impact: Impacts change-management evidence and operational reliability expectations under SOC2/internal SDLC policy.
+
+Code Quality Score: 8.2/10
+
+Security Assessment:
+- No direct SQL injection, command injection, deserialization, authentication bypass, or secret exposure found in the submitted Java source.
+- ForwardedHeaderFilter use is appropriate for reverse-proxy deployments, but trust in forwarded headers should be restricted to known proxy environments through infrastructure configuration.
+- Input surface is limited to configuration properties; however, app.routing.public-domain is not validated and could produce malformed OpenAPI server URLs if misconfigured.
+- No sensitive logging, insecure cryptography, insecure randomness, or resource-leak patterns were detected in this file.
+
+Compliance Checklist:
+- Secure coding basics: Met for this file; no direct high-risk coding vulnerability found.
+- Java/Spring Boot conventions: Mostly met.
+- Error handling: Met for current scope; no exception-prone logic beyond configuration normalization.
+- Input validation: Partially met; public domain configuration lacks strict validation.
+- Configuration management: Partially met; hardcoded port in code is not ideal.
+- Logging/auditability: Partially met; no structured startup logging or deployment verification evidence.
+- DTO/entity separation: N/A for this configuration class.
+- Tests: Not met for the reviewed change; no automated verification included.
+- PCI-DSS: No cardholder-data handling observed; N/A for this file.
+- GDPR/HIPAA/privacy: No PII/PHI processing observed in this file; N/A for this scope.
+- SOC2/change management: Partially met; deployment validation evidence is missing.
+
+Audit Log Reference: CR-120640-20261123-001
